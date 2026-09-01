@@ -1,3 +1,49 @@
+# pacemaker with multi-GPU / multi-node fitting
+
+A fork of [ICAMS/python-ace](https://github.com/ICAMS/python-ace) (pacemaker), with [ICAMS/TensorPotential](https://github.com/ICAMS/TensorPotential) (pacemaker's TensorFlow backend) in
+`TensorPotential/`. Same model, `input.yaml` and potential files as upstream. The original
+pacemaker README follows at the end.
+
+## Install
+
+```bash
+conda create -n pace python=3.10 && conda activate pace     # TensorPotential needs Python < 3.11
+pip install tensorflow
+pip install mpi4py                  # built against the cluster's MPI
+pip install .                       # pacemaker
+pip install ./TensorPotential       # the TensorFlow backend
+```
+
+**Updating:** `git pull`, then `pip install .` and `pip install ./TensorPotential` again.
+
+## Multi-GPU / multi-node fitting
+
+```bash
+PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 bash -c 'CUDA_VISIBLE_DEVICES=$SLURM_LOCALID pacemaker input.yaml'
+```
+
+- One MPI rank per GPU; the launch line gives each rank its own GPU.
+- Every rank runs the same optimizer. Each evaluates a contiguous share of the batches; loss and gradient are summed
+  over the ranks, so every rank takes the same step. Only rank 0 writes files.
+- Optimizers: BFGS, L-BFGS-B, CG.
+- `PACEMAKER_MPI_REPRODUCIBLE=1`: sums in a fixed rank order instead of the MPI library's (results still depend on
+  the number of ranks).
+- `PACEMAKER_MPI_SHARD=inbatch`: every rank evaluates every batch, but only its share of the structures in it. GPU
+  memory per rank drops by about the number of ranks, so `batch_size` can grow by that factor. It keeps up with the
+  default mode only while each GPU still gets about 100 structures per call.
+- `backend: gpu_config: {memory_growth: true}`: TensorFlow takes GPU memory as it needs it instead of all at once.
+- Without `PACEMAKER_MPI=1` nothing changes: one process runs the upstream code.
+
+## Credits and licence
+
+pacemaker / python-ace and TensorPotential are by Yury Lysogorskiy, Anton Bochkarev, Ralf Drautz et al. (ICAMS,
+Ruhr University Bochum); please cite their papers (below) when you use this code. This fork keeps the original
+**Academic Software Licence** (`LICENSE.md`): academic, non-commercial use; derivative works under the same licence.
+
+---
+
+*The original pacemaker README follows.*
+
 # Description
 
 This repository contains `pacemaker` - a tool for fitting of interatomic potentials in a general nonlinear Atomic Cluster Expansion (ACE) form.

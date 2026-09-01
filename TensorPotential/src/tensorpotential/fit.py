@@ -8,9 +8,91 @@ from scipy.optimize import minimize, dual_annealing
 from tensorpotential.constants import *
 from tensorpotential.utils.utilities import batching_data
 from tensorpotential.fitmetrics import FitMetrics
+from tensorpotential import mpi
 
 log = logging.getLogger(__name__)
 log.setLevel(logging.DEBUG)
+
+
+def _split_contiguous(seq):
+    """This rank's contiguous chunk of `seq` (list). Whole list if MPI off/1 rank.
+    Contiguous (not strided) so that a rank-ordered gather reconstructs the
+    original element order with no reindexing."""
+    w = mpi.world_size()
+    if w == 1:
+        return list(seq)
+    parts = np.array_split(np.arange(len(seq)), w)
+    idx = parts[mpi.rank()]
+    return [seq[i] for i in idx]
+
+
+def _combine_error_lists(de, de_pa, df, total_na):
+    """vstack the local per-structure error lists, then (if distributed)
+    allgather across ranks in rank order so every rank holds the full,
+    original-order arrays -> FitMetrics.compute_metrics is then identical to
+    the single-process result."""
+    de = np.vstack(de) if de else np.zeros((0, 1))
+    de_pa = np.vstack(de_pa) if de_pa else np.zeros((0, 1))
+    df = np.vstack(df) if df else np.zeros((0, 3))
+    total_na = np.vstack(total_na) if total_na else np.zeros((0, 1))
+    if mpi.is_distributed():
+        de = mpi.allgather_vstack(de)
+        de_pa = mpi.allgather_vstack(de_pa)
+        df = mpi.allgather_vstack(df)
+        total_na = mpi.allgather_vstack(total_na)
+    return de, de_pa, df, total_na
+
+
+def _my_struct_range(n_struct):
+    """This rank's contiguous [lo, hi) slice of range(n_struct). Empty slice -> lo==hi."""
+    w = mpi.world_size()
+    if w == 1:
+        return 0, n_struct
+    parts = np.array_split(np.arange(n_struct), w)
+    p = parts[mpi.rank()]
+    if len(p) == 0:
+        return 0, 0
+    return int(p[0]), int(p[-1]) + 1
+
+
+def slice_batch_structs(b, s_lo, s_hi):
+    """Return a new super-batch dict containing only structures [s_lo, s_hi) of `b`,
+    with every offset-index array (ind_i/ind_j/e_map/cell_map/pair_map) re-based to
+    start at 0 -- i.e. a self-consistent smaller batch that `external_fit` accepts.
+
+    Relies on how utilities.supply_batch() lays a batch out: structures are stored
+    consecutively, so their atoms and their (intra-structure) neighbour pairs are
+    each a contiguous run; e_map/cell_map are ascending atom->structure indices and
+    pair_map is the ascending pair->structure index. Returns None for an empty slice.
+    """
+    if s_hi <= s_lo:
+        return None
+    e_map = b['e_map']
+    pair_map = b['pair_map']
+    a_lo = int(np.searchsorted(e_map, s_lo, side='left'))
+    a_hi = int(np.searchsorted(e_map, s_hi, side='left'))
+    p_lo = int(np.searchsorted(pair_map, s_lo, side='left'))
+    p_hi = int(np.searchsorted(pair_map, s_hi, side='left'))
+    return {
+        # per-atom
+        'positions': b['positions'][a_lo:a_hi],
+        'forces':    b['forces'][a_lo:a_hi],
+        'fweights':  b['fweights'][a_lo:a_hi],
+        'cell_map':  b['cell_map'][a_lo:a_hi] - s_lo,
+        'e_map':     b['e_map'][a_lo:a_hi] - s_lo,
+        # per-structure
+        'energy':    b['energy'][s_lo:s_hi],
+        'eweights':  b['eweights'][s_lo:s_hi],
+        'cell':      b['cell'][s_lo:s_hi],
+        # per-pair (neighbour list); pairs are intra-structure so ind_* stay in-range
+        'ind_i':     b['ind_i'][p_lo:p_hi] - a_lo,
+        'ind_j':     b['ind_j'][p_lo:p_hi] - a_lo,
+        'mu_i':      b['mu_i'][p_lo:p_hi],
+        'mu_j':      b['mu_j'][p_lo:p_hi],
+        'offsets':   b['offsets'][p_lo:p_hi],
+        'pair_map':  b['pair_map'][p_lo:p_hi] - s_lo,
+    }
+
 
 NUMPY_OPTIMIZERS = ['BFGS', 'L-BFGS-B', 'CG', 'trf', 'dogbox', 'lm', 'dual_annealing']
 TF_OPTIMIZERS = ['Adam', 'SGD']
@@ -54,7 +136,51 @@ class FitTensorPotential:
         self.data_df = df
         self.batch_size = batch_size
         batches = batching_data(self.data_df, batch_size=batch_size)
-        self.n_batches = len(batches)
+        self.n_batches = len(batches)  # GLOBAL batch count (reg. scaling depends on this)
+
+        # --- data-parallel work split. Two modes (mpi.shard_mode()):
+        #  batchlist: each rank runs a contiguous slice of the batch LIST.
+        #             Per-GPU memory unchanged (whole batches land on one GPU).
+        #  inbatch:   every rank runs EVERY batch but only its contiguous slice of
+        #             that batch's structures (see slice_batch_structs). Per-GPU
+        #             memory ~1/W -> `batch_size` can go up ~Wx.
+        #  inbatch makes W times more, smaller calls per rank, so it is only as fast
+        #  as batchlist when each GPU still gets ~100 structures per call.
+        # Metrics/weights below stay GLOBAL (full list) so per-iteration metrics
+        # match the single-process result after the error arrays are allgathered.
+        self._inbatch = False
+        if mpi.is_distributed():
+            if optimizer not in ('BFGS', 'L-BFGS-B', 'CG'):
+                raise NotImplementedError(
+                    "PACEMAKER_MPI data-parallel training supports optimizer in "
+                    "{'BFGS','L-BFGS-B','CG'} only; got '%s'. Run single-GPU for "
+                    "the least-squares / dual_annealing / Adam / SGD paths." % optimizer)
+            if mpi.shard_mode() == 'inbatch':
+                self._inbatch = True
+                local_batches = batches  # every rank keeps every batch; sliced in fit_func
+                # predict() runs root-only and un-sharded; the yaml batch_size is a
+                # GLOBAL super-batch here (only batch_size/W ever lands on one GPU during
+                # the fit), so cap predict's tiling to that per-GPU size or it OOMs.
+                self._predict_batch_size = max(1, -(-self.batch_size // mpi.world_size()))
+                _bs = -(-len(self.data_df) // self.n_batches)   # ceil structs per batch
+                log.info("[rank %d/%d] in-batch sharding: ~%d of ~%d structs per batch",
+                         mpi.rank(), mpi.world_size(),
+                         -(-_bs // mpi.world_size()), _bs)
+                # regularization is added once per external_fit call, scaled 1/n_batches.
+                # In inbatch mode every batch is evaluated W times (once per rank), so
+                # let ONLY rank 0 carry the reg term; Allreduce(sum) then counts it once.
+                if not mpi.is_root():
+                    for _k in (L1_REG, L2_REG, AUX_LOSS_FACTOR):
+                        if _k in self.tensorpot.loss_specs:
+                            self.tensorpot.loss_specs[_k] = tf.zeros_like(
+                                self.tensorpot.loss_specs[_k])
+            else:
+                local_batches = _split_contiguous(batches)
+                log.info("[rank %d/%d] %d of %d batches (contiguous shard)",
+                         mpi.rank(), mpi.world_size(), len(local_batches), len(batches))
+        else:
+            local_batches = batches
+        self._local_batches = local_batches
 
         w_e = np.vstack([b['eweights'] for b in batches])
         w_f = np.vstack([b['fweights'] for b in batches])
@@ -120,7 +246,7 @@ class FitTensorPotential:
                 # reset fit_metrics_data_dict here and every time in self.callback. No need to store complete history
                 self.fit_metrics_data_dict = {}
                 res_opt = minimize(self.fit_func, coefs, method=optimizer, jac=True,
-                                   args=(batches,), options=options,
+                                   args=(local_batches,), options=options,
                                    callback=self.callback)
                 self.process_test_metric()
 
@@ -216,24 +342,71 @@ class FitTensorPotential:
         de, de_pa, df = ([] for _ in range(3))
         total_na = []
         t0 = time.time()
-        for b in batches:
-            loss, jac, e, f = self.tensorpot.external_fit(x, b, eager=self.eager)
-            tot_jac += jac.numpy()
-            tot_loss += loss.numpy()
-            errors = self.compute_batch_errors(b, e.numpy(), f.numpy())
-            de.append(errors[0])
-            de_pa.append(errors[1])
-            df.append(errors[2])
-            total_na.append(errors[3])
+        if not mpi.is_distributed():
+            # single process: behave exactly like stock (let any error propagate
+            # untouched so FitBackendAdapter's retry loop sees the real exception).
+            for b in batches:
+                loss, jac, e, f = self.tensorpot.external_fit(x, b, eager=self.eager)
+                tot_jac += jac.numpy()
+                tot_loss += loss.numpy()
+                errors = self.compute_batch_errors(b, e.numpy(), f.numpy())
+                de.append(errors[0])
+                de_pa.append(errors[1])
+                df.append(errors[2])
+                total_na.append(errors[3])
+        else:
+            # distributed: if ANY rank hits an OOM, every rank must raise together
+            # so the batch-size-reduction retry in FitBackendAdapter.fit stays
+            # collective (a lone rank raising would deadlock the others in Allreduce).
+            inbatch = getattr(self, '_inbatch', False)
+            oom = 0
+            try:
+                for b in batches:
+                    if inbatch:
+                        s_lo, s_hi = _my_struct_range(len(b['energy']))
+                        sb = slice_batch_structs(b, s_lo, s_hi)
+                        if sb is None:
+                            continue          # no structures of this batch on this rank
+                    else:
+                        sb = b
+                    loss, jac, e, f = self.tensorpot.external_fit(x, sb, eager=self.eager)
+                    tot_jac = tot_jac + jac.numpy()
+                    tot_loss += float(loss.numpy())
+                    errors = self.compute_batch_errors(sb, e.numpy(), f.numpy())
+                    de.append(errors[0])
+                    de_pa.append(errors[1])
+                    df.append(errors[2])
+                    total_na.append(errors[3])
+            except tf.errors.ResourceExhaustedError:
+                oom = 1
+            oom = mpi.allreduce_max(oom)
+            if oom:
+                raise tf.errors.ResourceExhaustedError(
+                    None, None, "OOM during batch evaluation (possibly on another rank)")
+            if np.ndim(tot_jac) == 0:
+                # this rank evaluated nothing (all its in-batch slices were empty)
+                tot_jac = np.zeros(self.ncoefs, dtype=np.float64)
+
+        # --- data-parallel reduction: global full-dataset loss + jacobian ---
+        tot_loss = mpi.allreduce_scalar_sum(tot_loss)
+        if mpi.is_distributed():
+            tot_jac = mpi.allreduce_array_sum(tot_jac)
 
         self.fit_coefs = x
         self.eval_count += 1
         self.eval_time = time.time() - t0
+        # gather the per-structure error arrays so every rank computes the SAME
+        # dataset-global metrics (identical to the single-process result).
+        g_de, g_de_pa, g_df, g_na = _combine_error_lists(de, de_pa, df, total_na)
         # collect all relevant info into FitMetrics
         self.metrics.regs = self.get_reg_components()
         self.metrics.reg_weights = self.get_reg_weights()
-        self.metrics.compute_metrics(np.vstack(de), np.vstack(de_pa), np.vstack(df),
-                                     np.vstack(total_na), dataframe=self.data_df)
+        # inbatch mode: allgather interleaves per-batch structure slices, so the
+        # concatenation order != dataframe order -> the low-energy mask (indexed by
+        # df position) would misalign. Global RMSE/MAE/MAX are order-independent and
+        # stay exact; skip only the "low" sub-metrics by passing dataframe=None.
+        _df_for_metrics = None if getattr(self, '_inbatch', False) else self.data_df
+        self.metrics.compute_metrics(g_de, g_de_pa, g_df, g_na, dataframe=_df_for_metrics)
         self.metrics.loss = tot_loss
         self.metrics.eval_time = self.eval_time
         # do a snapshot of  FitMetrics into FitMetricsData: loss, e_loss, f_loss, reg_loss, RMSE, MAE, MAX_E (E,F), timing
@@ -247,7 +420,7 @@ class FitTensorPotential:
         if self.iter_num == 0:
             if self.fit_metric_callback is not None:
                 self.fit_metric_callback(curr_fit_metrics_data)
-            else:
+            elif mpi.is_root():
                 print_detailed_metrics(curr_fit_metrics_data, title='Initial state:')
                 print_extended_metrics(curr_fit_metrics_data, title='INIT STATS')
 
@@ -283,29 +456,45 @@ class FitTensorPotential:
         # call global callback
         self.metrics.record_time(self.eval_time)
 
+        # --- data-parallel safety net: every rank runs its own (replicated) scipy
+        # optimizer; they stay in lock-step only because fit_func returns identical
+        # (loss, jac) to all ranks. Assert they have not drifted.
+        if mpi.is_distributed():
+            x_ref = mpi.bcast(np.ascontiguousarray(x) if mpi.is_root() else None)
+            dev = mpi.allreduce_max(float(np.max(np.abs(x - x_ref))))
+            tol = 1e-9 * (1.0 + float(np.max(np.abs(x_ref))))
+            if dev > tol:
+                raise RuntimeError(
+                    "[rank %d] replicated optimizer diverged: max|x-x_root|=%.3e > %.3e"
+                    % (mpi.rank(), dev, tol))
+
         # get true metrics data that correspond to actual successfull x
         true_fit_metric_data = self.update_last_metrics(x)
 
         if self.fit_metric_callback is not None:
             # example of fit_metric_callback is:  print_extended_metrics
             self.fit_metric_callback(true_fit_metric_data)
-        else:
+        elif mpi.is_root():
             if self.iter_num % self.display_step == 0:
                 print_extended_metrics(true_fit_metric_data)
             else:
                 print_detailed_metrics(true_fit_metric_data)
-        # test metric
+        # test metric: runs on every rank (each evaluates the full small test
+        # set locally) so test-based early stopping is a collective decision; the
+        # yaml snapshot inside is still root-only.
         if self.iter_num % self.display_step == 0:
             self.process_test_metric(updating_coefs=x)
         self.iter_num += 1
 
-        if self.iter_num % self.display_step == 0:
+        if mpi.is_root() and self.iter_num % self.display_step == 0:
             self.tensorpot.potential.get_updated_config(prefix=self.iter_num)
 
         # clean fit_metrics_data_dict for next iteration
         # self.fit_metrics_data_dict = {}
 
-        if self.global_callback is not None:
+        # global_callback chains into GeneralACEFit's interim-potential / plot
+        # writers -> run on root only.
+        if self.global_callback is not None and mpi.is_root():
             self.global_callback(x, *args, **kwargs)
 
     def process_test_metric(self, title="TEST_STATS", updating_coefs=None):
@@ -315,8 +504,9 @@ class FitTensorPotential:
             curr_test_metrics_data["iter_num"] = self.iter_num
             self.last_test_metric_data = curr_test_metrics_data
             if self.test_metric_callback is not None:
+                # runs on every rank -> detect_early_stopping('test') decides identically
                 self.test_metric_callback(curr_test_metrics_data)
-            else:
+            elif mpi.is_root():
                 print_extended_metrics(curr_test_metrics_data, title=title)
 
     def update_last_metrics(self, x):
@@ -330,10 +520,11 @@ class FitTensorPotential:
         return true_fit_metric_data
 
     def predict(self, datadf=None):
+        _pbs = getattr(self, '_predict_batch_size', self.batch_size)
         if datadf is None:
-            batches = batching_data(self.data_df, batch_size=self.batch_size)
+            batches = batching_data(self.data_df, batch_size=_pbs)
         else:
-            batches = batching_data(datadf, batch_size=self.batch_size)
+            batches = batching_data(datadf, batch_size=_pbs)
 
         pred_dict = {'energy_pred': [],
                      'forces_pred': [],
@@ -395,7 +586,12 @@ class FitTensorPotential:
 
     def compute_test_metric(self, updating_coefs=None):
         if self.test_df is not None:
-            self.tensorpot.potential.get_updated_config(updating_coefs=updating_coefs, prefix=self.iter_num)
+            # every rank must assign `updating_coefs` so its local predict() is correct;
+            # only root also writes the interim_potential_<N>.yaml snapshot.
+            if mpi.is_root():
+                self.tensorpot.potential.get_updated_config(updating_coefs=updating_coefs, prefix=self.iter_num)
+            else:
+                self.tensorpot.potential.get_updated_config(updating_coefs=updating_coefs)
             # 'energy_pred', 'forces_pred', 'stress_pred',
             # 'de', 'de_pa', 'df', 'total_na'
             test_pred = self.predict(datadf=self.test_df)

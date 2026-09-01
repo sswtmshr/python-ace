@@ -151,6 +151,7 @@ class FitMetrics:
         self.low_max_abs_f = 0
         self.low_rmse_f_comp = 0
         self.low_mae_f_comp = 0
+        self.low_max_abs_f_comp = 0  # missing from upstream defaults; needed when dataframe is None (MPI in-batch mode)
 
         if dataframe is not None:
             try:

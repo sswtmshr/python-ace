@@ -241,9 +241,12 @@ def _set_gpu_config(config=None):
     conf_dict = {}
     conf_dict[GPU_INDEX] = 0
     conf_dict[GPU_MEMORY_LIMIT] = 0
+    conf_dict[GPU_MEMORY_GROWTH] = False
 
     if config is not None:
         assert isinstance(config, dict), 'gpu_config must be a dict'
+        if GPU_MEMORY_GROWTH in config:
+            conf_dict[GPU_MEMORY_GROWTH] = bool(config[GPU_MEMORY_GROWTH])
         if GPU_INDEX in config:
             assert isinstance(config[GPU_INDEX], int), '{} must be an integer'.format(GPU_INDEX)
             conf_dict[GPU_INDEX] = config[GPU_INDEX]
@@ -279,6 +282,14 @@ def init_gpu_config(gpu_config):
             assert gpu_config[GPU_INDEX] < len(avail_gpus), \
                 'GPU ind {} is requested, but there are only {} GPUs'.format(gpu_config[GPU_INDEX], len(avail_gpus))
             sel_gpus = avail_gpus[gpu_config[GPU_INDEX]]
+            if gpu_config.get(GPU_MEMORY_GROWTH):
+                # let TF grow its pool on demand instead of pre-grabbing ~all of
+                # the 40 GB up front -- needed to see the true working set and to
+                # leave headroom (e.g. under in-batch structure sharding).
+                try:
+                    tf.config.experimental.set_memory_growth(sel_gpus, True)
+                except (RuntimeError, ValueError) as e:
+                    print(e)
             if gpu_config[GPU_MEMORY_LIMIT] != 0:
                 try:
                     tf.config.set_logical_device_configuration(
