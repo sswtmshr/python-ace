@@ -63,6 +63,44 @@ def test_triton_kernels_match_torch():
         assert err < 1e-11, "{}: relative difference {:.2e}".format(name, err)
 
 
+def test_radial_and_embedding_types_match_cpp():
+    """Every radial basis and embedding type against the C++ evaluator (what LAMMPS runs). Catches training formulas
+    that differ from C++ (TF had ChebExpCos without the dcut taper and a different FinnisSinclair)."""
+    from ase.build import bulk
+    from ase import Atoms
+    from pyace import PyACECalculator
+    from pyace.multispecies_basisextension import create_multispecies_basis_config
+    from pyace.atomicenvironment import generate_tp_atoms
+    from ase.calculators.singlepoint import SinglePointCalculator
+    import pandas as pd
+    from pacetorch.data import batching_data
+    from pacetorch.potential import TorchPotential
+    rng = np.random.default_rng(0)
+    at = bulk("Si", "diamond", a=5.3, cubic=True)
+    at = Atoms(rng.choice(["C", "Si"], len(at)), positions=at.positions, cell=at.cell, pbc=True)
+    at.rattle(0.15, seed=1)
+    for radbase, par in (("SBessel", 5.25), ("ChebExpCos", 5.25), ("ChebPow", 2.0)):
+        for npot, fs in (("FinnisSinclairShiftedScaled", [1, 1, 1, 0.5]), ("FinnisSinclair", [1, 1, 1, 0.5])):
+            b = create_multispecies_basis_config({
+                "elements": ["C", "Si"], "embeddings": {"ALL": {"npot": npot, "fs_parameters": fs, "ndensity": 2}},
+                "bonds": {"ALL": {"radbase": radbase, "radparameters": [par], "rcut": 4.5, "dcut": 0.01,
+                                  "NameOfCutoffFunction": "cos", "nradbase": 6}},
+                "functions": {"ALL": {"nradmax_by_orders": [6, 3, 2], "lmax_by_orders": [0, 2, 1]}}})
+            ace = A.ACE(b)
+            c0 = ace.get_coefs()
+            ace.set_coefs(c0 + np.random.default_rng(5).normal(scale=0.2, size=c0.shape))
+            b = ace.get_updated_config()
+            b.deltaSplineBins = 2e-5          # C++ spline interpolation error well below the tolerance
+            x = at.copy(); x.calc = PyACECalculator(b)
+            e_ref, f_ref = x.get_potential_energy(), x.get_forces()
+            y = at.copy(); y.calc = SinglePointCalculator(y, energy=0., forces=np.zeros((len(y), 3)))
+            df = pd.DataFrame(dict(tp_atoms=[generate_tp_atoms(y, cutoff=4.5)], w_energy=[1.], w_forces=[np.ones(len(y))]))
+            tp = TorchPotential(A.ACE(b))
+            e, f, _ = tp.evaluate(tp.device_batch(batching_data(df, 1)[0]))
+            de, dF = abs(float(e[0, 0]) - e_ref) / len(at), float(np.max(np.abs(f.numpy() - f_ref)))
+            assert de < 1e-9 and dF < 1e-6, "{} + {}: dE/at {:.1e} eV, dF {:.1e} eV/A".format(radbase, npot, de, dF)
+
+
 def _model_and_batch():
     from ase.build import bulk
     from pyace.atomicenvironment import generate_tp_atoms
@@ -149,6 +187,7 @@ if __name__ == "__main__":
     test_segouter_derivatives()
     test_products_match_direct_formula()
     test_abasis_paths_agree()
+    test_radial_and_embedding_types_match_cpp()
     if torch.cuda.is_available():
         test_triton_kernels_match_torch()
     print("ok")

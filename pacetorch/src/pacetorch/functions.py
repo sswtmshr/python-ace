@@ -1,6 +1,11 @@
 """Radial functions, cutoffs, spherical harmonics and embeddings of TensorPotential 0.2 (tensorpotential/functions,
-potentials/ace.py), ported 1:1 to torch (float64). Same formulas, same branch conventions, so a fit gives the same
-potential as the TF backend."""
+potentials/ace.py), ported to torch (float64). Same formulas and branch conventions as TF, except where TF differs
+from the C++ evaluator that LAMMPS runs (ace-evaluator ace_radial.cpp / ace_abstract_basis.cpp); there the C++
+formula is used, so that a fitted potential behaves in LAMMPS as it did in the fit:
+  * ChebExpCos: C++ also tapers the last dcut before rcut with a cosine; TF does not (forces differ in that shell);
+  * FinnisSinclair embedding: C++ F = sign(x) [(1 - g)|x|^m + w^(1-m) g |x|], g = exp(-(w|x|)^3), w = 1e6;
+    TF used a different small-|x| smoothing (g = exp(-10 x^2), m g |x|), different whenever |x| < ~1.
+SBessel, ChebPow and FinnisSinclairShiftedScaled were already identical in TF and C++."""
 import math
 
 import numpy as np
@@ -51,14 +56,19 @@ def simplified_bessel(x, rc, deg):
     return torch.stack(sbf, dim=1)
 
 
-def radial_function(d, nfunc, ftype, cutoff, lmbda):
+def radial_function(d, nfunc, ftype, cutoff, lmbda, dcut=0.):
     """d: [P] -> [P, nfunc]"""
     if ftype == "ChebExpCos":
+        # as C++ chebExpCos: g_0 = 1, g_n = (1 - T_n(x)) / 2, times the cos envelope, times a cos taper on
+        # [rcut - dcut, rcut]
         d_ch = 1. - 2. * ((torch.exp(-lmbda * (d / cutoff - 1.)) - 1.) / (math.exp(lmbda) - 1.))
-        cheb = chebvander(d_ch, nfunc)
-        cos_cut = cutoff_func_cos(d, cutoff).unsqueeze(1)
-        gk = torch.where(cheb == 1., cheb * cos_cut, 0.5 * (1 - cheb) * cos_cut)
-        return gk[:, :-1] if nfunc == 1 else gk
+        cheb = chebvander(d_ch, nfunc)[:, :nfunc]
+        gk = torch.cat([cheb[:, :1], 0.5 - 0.5 * cheb[:, 1:]], 1) * cutoff_func_cos(d, cutoff).unsqueeze(1)
+        if dcut > 0:
+            x0 = cutoff - dcut
+            taper = torch.where(d > x0, 0.5 * (1. + torch.cos(math.pi * (d - x0) / dcut)), torch.ones_like(d))
+            gk = gk * taper.unsqueeze(1)
+        return gk
     if ftype == "ChebPow":
         d_ch = 2.0 * (1.0 - torch.abs(1.0 - d / cutoff) ** lmbda) - 1.0
         cheb = 0.5 - 0.5 * chebvander(d_ch, nfunc + 1)[:, 1:]
@@ -183,10 +193,14 @@ def embedding(rho, mexp, ftype):
         yoff = nx ** (1 / (1.0 - nx)) * exprho
         return torch.sign(rho) * ((xoff + arho) ** mexp - yoff)
     if ftype == "FinnisSinclair":
-        w = 10.
-        y1 = w * rho ** 2
-        g = torch.where(30. < y1, 0. * rho, torch.exp(-y1))
+        # C++ Fexp (ace_abstract_basis.cpp)
+        w, eps = 1.e6, 1e-10
+        lam = (1. / w) ** (mexp - 1.)
         a = torch.abs(rho)
-        f = torch.sign(rho) * ((((1. - g) * a + 1e-20) ** mexp) + mexp * g * a)
-        return torch.where(a < 1e-10, mexp * rho, f)
+        small = a <= eps
+        a = torch.where(small, torch.ones_like(a), a)          # keeps the unused branch finite (gradients)
+        w3 = (w * a) ** 3
+        g = torch.exp(-torch.clamp(w3, max=30.)) * (w3 <= 30.)
+        f = torch.sign(rho) * ((1. - g) * a ** mexp + lam * g * a)
+        return torch.where(small, lam * rho, f)
     raise ValueError("Unknown embedding {}".format(ftype))

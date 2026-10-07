@@ -206,6 +206,7 @@ class ACE:
 
         # ---- basis coefficient indices (relative to basis_coefs = coefs[total_num_crad:])
         coefs_r1 = {c: [] for c in self.bond_combs}
+        r1_n = {c: [] for c in self.bond_combs}      # radial basis column (n - 1) of every rank-1 function
         self.coefs_rk_part = {c: [] for c in self.bond_combs}
         coefs_part = {}
         count = 0
@@ -215,6 +216,8 @@ class ACE:
             coefs_part[ne] = []
             rank = 0
             for f in list(b.basis_rank1[ne]) + list(b.basis[ne]):
+                if f.rank == 1:
+                    r1_n[(f.mu0, f.mus[0])].append(f.ns[0] - 1)
                 for _ in f.coeffs:
                     key = (f.mu0, f.mus[0])
                     if f.rank == 1:
@@ -290,12 +293,12 @@ class ACE:
             o_r = [pos(n, l, lm) for (n, l, lm) in ch]
             o_i = [pos(n, l, lm) + 2 * l + 1 for (n, l, lm) in ch]
             self.bonds.append(dict(
-                c=c, nradmax=bs.nradmax, lmax=bs.lmax, nradbase=bs.nradbasemax, rcut=float(bs.rcut),
+                c=c, nradmax=bs.nradmax, lmax=bs.lmax, nradbase=bs.nradbasemax, rcut=float(bs.rcut), dcut=float(bs.dcut),
                 radbase=bs.radbasename, lmbda=float(bs.radparameters[0]),
                 rcut_in=float(bs.rcut_in), dcut_in=float(bs.dcut_in),
                 prehc=float(bs.prehc), lambdahc=float(bs.lambdahc),
                 crad=self.bond_to_slice[c], nd=self.embed_spec[e].ndensity,
-                r1_idx=torch.tensor(coefs_r1[c], dtype=torch.long),
+                r1_idx=torch.tensor(coefs_r1[c], dtype=torch.long), r1_n=torch.tensor(r1_n[c], dtype=torch.long),
                 nl_idx=torch.tensor(nl_idx, dtype=torch.long), lm_idx=torch.tensor(lm_idx, dtype=torch.long),
                 sh=SphericalHarmonics(lmax_used) if ch else None, has_A=bool(ch),
                 L=lmax_used,
@@ -319,7 +322,7 @@ class ACE:
                 R["idx"] = [mv(i) for i in R["idx"]]
                 R["gcg"], R["msum"] = mv(R["gcg"]), mv(R["msum"])
         for B in self.bonds:
-            for k in ("r1_idx", "nl_idx", "lm_idx", "o_r", "o_i"):
+            for k in ("r1_idx", "r1_n", "nl_idx", "lm_idx", "o_r", "o_i"):
                 B[k] = mv(B[k])
         self.coefs = self.coefs.to(self.device)
         return self
@@ -452,12 +455,14 @@ class ACE:
             phi = B["prehc"] * torch.exp(-B["lambdahc"] * d ** 2) / d * fcp
             phi_cols[ci] = zero_nat.index_add(0, P["central"], phi)
             # radial basis g_k(r), damped inside the inner cutoff
-            g = radial_function(d, B["nradbase"], B["radbase"], B["rcut"], B["lmbda"]) * (1 - fcp).unsqueeze(1)
-            # rank 1: sum_j g_k, then rho += G @ c_r1
+            g = radial_function(d, B["nradbase"], B["radbase"], B["rcut"], B["lmbda"], B["dcut"]) * (1 - fcp).unsqueeze(1)
+            # rank 1: sum_j g_k, then rho += G @ c_r1; function (n) -> radial basis column n - 1, so a basis with
+            # fewer rank-1 functions than nradbase, or in another order, is handled (TF assumed n = 1..nradbase)
             if len(B["r1_idx"]):
                 G = torch.zeros(len(idx["atoms_e_cpu"][e]), g.shape[1], dtype=torch.float64,
                                 device=dev).index_add(0, P["central_local"], g)
-                c1 = bcoefs.index_select(0, B["r1_idx"]).reshape(-1, B["nd"])
+                c1 = torch.zeros(g.shape[1], B["nd"], dtype=torch.float64, device=dev).index_add(
+                    0, B["r1_n"], bcoefs.index_select(0, B["r1_idx"]).reshape(-1, B["nd"]))
                 r1 = G @ c1
                 if B["nd"] < nd_max:
                     r1 = torch.nn.functional.pad(r1, (0, nd_max - B["nd"]))

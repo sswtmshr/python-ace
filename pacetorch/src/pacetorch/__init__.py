@@ -1,7 +1,7 @@
 """pacetorch: PyTorch backend for pacemaker (linear/FS B-basis ACE), a drop-in for TensorPotential 0.2."""
 import logging
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 log = logging.getLogger(__name__)
 
 

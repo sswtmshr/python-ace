@@ -111,3 +111,11 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - 11.03 -> 7.64 s (job 59476318, memory unchanged); as released 6.88 s / 11.66 GiB (job 59475464). Of the A-basis
   gain, 22% from 11 and 78% from the kernels. Exact vs TensorFlow (gradient 9e-14).
 - Batch size 47 -> 94 -> 188 gains only 7%, then 5%: the memory saving buys larger bases and structures.
+
+### 13. Training matches the C++ evaluator (LAMMPS) (2026-10-07)
+
+| feature | upstream training vs LAMMPS | after |
+|---|---|---|
+| ChebExpCos radial basis | no cos taper near rcut: forces off ~1e-2 eV/A | C++ formula |
+| FinnisSinclair embedding (exponent != 1) | different small-rho smoothing: up to 3e-2 eV/at | C++ formula |
+| rank-1 functions | assumed ordered n = 1..nradbase: crash for partial sets | mapped by n |

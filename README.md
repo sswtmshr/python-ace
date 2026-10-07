@@ -119,6 +119,17 @@ SiC benchmark set (3735 structures, 538k atoms, 5640 coefficients, batch 94), on
 The product basis is a shared-prefix tree plus one matrix multiply; the A-basis uses hand-written derivatives, run
 as fused Triton kernels on NVIDIA GPUs (exact torch fallback elsewhere).
 
+## Training matches LAMMPS
+
+The PyTorch backend now uses the C++ evaluator's formulas (what LAMMPS `pair_style pace` runs) where upstream's
+training differed; the TensorFlow backend keeps upstream's:
+
+| | upstream training | here |
+|---|---|---|
+| ChebExpCos radial basis | no cos taper near rcut (forces off ~1e-2 eV/A) | C++ formula |
+| FinnisSinclair embedding (exponent != 1) | different small-rho smoothing (up to 3e-2 eV/atom) | C++ formula |
+| rank-1 functions | assumed ordered n = 1..nradbase (crash for partial sets) | mapped by n |
+
 ## Credits and licence
 
 pacemaker / python-ace and TensorPotential are by Yury Lysogorskiy, Anton Bochkarev, Ralf Drautz et al. (ICAMS,
