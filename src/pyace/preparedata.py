@@ -87,6 +87,7 @@ def check_df_non_empty(df: pd.DataFrame):
 
 
 WEIGHTS_STRESS_COLUMN = "w_stress"
+SOURCE_INDEX_COLUMN = "_source_index"   # index of each structure in its dataset file (external weights refer to it)
 
 
 def set_policy_stress_weights(df: pd.DataFrame, policy_weights, source="weighting policy"):
@@ -446,10 +447,15 @@ class UniformWeightingPolicy(StructuresDatasetWeightingPolicy):
 
 class ExternalWeightingPolicy(StructuresDatasetWeightingPolicy):
 
-    def __init__(self, filename_or_df: str):
+    def __init__(self, filename_or_df: str = None, filename: str = None):
         """
-        :param filename: .pckl.gzip filename of dataframe with index and  `w_energy` and `w_forces` columns
+        :param filename_or_df: .pckl.gzip filename (or dataframe) with the dataset's index and `w_energy`, `w_forces`
+            (optionally `w_stress`) columns; `filename` is accepted as an alias (the documented key)
         """
+        if filename_or_df is None:
+            filename_or_df = filename
+        if filename_or_df is None:
+            raise ValueError("ExternalWeightingPolicy needs `filename` (or `filename_or_df`)")
         self.filename_or_df = filename_or_df
         self.weights_df = None
 
@@ -469,7 +475,15 @@ class ExternalWeightingPolicy(StructuresDatasetWeightingPolicy):
         for col in [WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN]:
             assert col in self.weights_df.columns, "`{}` column not in external weights dataframe".format(col)
 
-        if not all([w_ind in df.index for w_ind in self.weights_df.index]):
+        # the weights file is indexed like the dataset file; df was re-indexed after loading/concatenation and the
+        # train/test split, so match on the index each row had in its file (SOURCE_INDEX_COLUMN, set by load_dataset)
+        key = pd.Series(df.index, index=df.index)
+        if SOURCE_INDEX_COLUMN in df.columns and df[SOURCE_INDEX_COLUMN].is_unique and \
+                self.weights_df.index.isin(df[SOURCE_INDEX_COLUMN].values).all():
+            key = df[SOURCE_INDEX_COLUMN]
+        else:   # a weights file indexed like the re-indexed frame (what stock pacemaker matched against)
+            log.info("External weights: matched on the dataframe index (not the dataset file's own index)")
+        if not self.weights_df.index.isin(key.values).all():
             error_msg = "Not all structure indices from weights dataframe are in original dataframe"
             log.error(error_msg)
             raise ValueError(error_msg)
@@ -480,15 +494,19 @@ class ExternalWeightingPolicy(StructuresDatasetWeightingPolicy):
                 df.drop(columns=col_to_drop, inplace=True)
 
         ext_cols = [WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN]
-        if WEIGHTS_STRESS_COLUMN in self.weights_df.columns:
+        ds_stress = WEIGHTS_STRESS_COLUMN in df.columns and not df[WEIGHTS_STRESS_COLUMN].isna().all()
+        if WEIGHTS_STRESS_COLUMN in self.weights_df.columns and not ds_stress:   # a dataset w_stress column wins
             ext_cols.append(WEIGHTS_STRESS_COLUMN)
             if WEIGHTS_STRESS_COLUMN in df.columns:
                 df = df.drop(columns=WEIGHTS_STRESS_COLUMN)
-        mdf = pd.merge(df, self.weights_df[ext_cols], left_index=True, right_index=True)
-        if WEIGHTS_STRESS_COLUMN in self.weights_df.columns:
+        # inner join on the source index, keeping df's own index (rows without external weights are dropped, as before)
+        mdf = df.assign(_w_key=key.values).join(self.weights_df[ext_cols], on="_w_key", how="inner")
+        mdf = mdf.drop(columns="_w_key")
+        if WEIGHTS_STRESS_COLUMN in ext_cols:
             log.info("Stress weights: from the external weights file")
         else:
-            set_policy_stress_weights(mdf, 1. / len(mdf), "uniform (external weights file has no w_stress column)")
+            set_policy_stress_weights(mdf, 1. / len(mdf), "uniform (external weights file has no w_stress column)"
+                                      if not ds_stress else "dataset column")
         if not (mdf[FORCES_COL].map(len) == mdf[WEIGHTS_FORCES_COLUMN].map(len)).all():
             error_msg = ("Shape of the `{}` column doesn't correspond to the shape of "
                          "`forces` column in original dataframe").format(WEIGHTS_FORCES_COLUMN)
@@ -540,7 +558,7 @@ def train_test_split(df, test_size: Union[float, int]) -> Tuple[pd.DataFrame, pd
     return df.iloc[train_inds].copy(), df.iloc[test_inds].copy()
 
 
-def get_weighting_policy(weighting_policy_spec: Dict) -> StructuresDatasetWeightingPolicy:
+def get_weighting_policy(weighting_policy_spec: Dict, default_seed=None) -> StructuresDatasetWeightingPolicy:
     if weighting_policy_spec is None:
         return UniformWeightingPolicy()
     elif isinstance(weighting_policy_spec, StructuresDatasetWeightingPolicy):
@@ -557,6 +575,11 @@ def get_weighting_policy(weighting_policy_spec: Dict) -> StructuresDatasetWeight
 
     if weighting_policy_spec[WEIGHTING_TYPE_KW] == ENERGYBASED_WEIGHTING_POLICY:
         del weighting_policy_spec[WEIGHTING_TYPE_KW]
+        if weighting_policy_spec.get("seed") is None and default_seed is not None:
+            # without a seed the policy reseeded numpy from OS entropy: irreproducible, and under MPI every rank got a
+            # different structure order. The top-level `seed` (default 42) is used instead.
+            log.info("EnergyBasedWeightingPolicy: no `seed` given, using the top-level seed {}".format(default_seed))
+            weighting_policy_spec["seed"] = default_seed
         weighting_policy = EnergyBasedWeightingPolicy(**weighting_policy_spec)
     elif weighting_policy_spec[WEIGHTING_TYPE_KW] == EXTERNAL_WEIGHTING_POLICY:
         del weighting_policy_spec[WEIGHTING_TYPE_KW]
@@ -589,24 +612,26 @@ def get_reference_dataset(evaluator_name, dataframe_fname):
     return ACEDataset(data_config={"filename": dataframe_fname}, evaluator_name=evaluator_name).fitting_data
 
 
-def apply_weights(df: Optional[pd.DataFrame], weighting_policy_spec, ignore_weights=False) -> Optional[pd.DataFrame]:
+def apply_weights(df: Optional[pd.DataFrame], weighting_policy_spec, ignore_weights=False,
+                  seed=None) -> Optional[pd.DataFrame]:
     if df is None:
         return
+    if ignore_weights and WEIGHTS_STRESS_COLUMN in df.columns:
+        df = df.drop(columns=WEIGHTS_STRESS_COLUMN)
     if WEIGHTS_ENERGY_COLUMN in df.columns and WEIGHTS_FORCES_COLUMN in df.columns and not ignore_weights:
         log.info("Both weighting columns ({} and {}) are found, no another weighting policy will be applied".format(
             WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN))
-        if WEIGHTS_STRESS_COLUMN in df.columns and not df[WEIGHTS_STRESS_COLUMN].isna().all():
-            log.info("Stress weights: the dataset's `{}` column".format(WEIGHTS_STRESS_COLUMN))
-        else:
-            log.info("Stress weights: uniform (the dataset has energy/force weight columns but no `{}` column)".format(
-                WEIGHTS_STRESS_COLUMN))
+        # uniform stress weights unless the dataset has its own column (kept); created here so that w_factor and
+        # aug_factor below apply to stress as on every other path
+        set_policy_stress_weights(df, 1. / len(df), "uniform (the dataset has energy/force weight columns but no "
+                                                    "`{}` column)".format(WEIGHTS_STRESS_COLUMN))
     else:
         if ignore_weights and (WEIGHTS_ENERGY_COLUMN in df.columns or WEIGHTS_FORCES_COLUMN in df.columns):
             log.info("Existing weights are ignored, weighting policy calculation is forced")
 
         if weighting_policy_spec is None:
             log.info("No weighting policy is specified, setting default weighting policy")
-        weighting_policy = get_weighting_policy(weighting_policy_spec)
+        weighting_policy = get_weighting_policy(weighting_policy_spec, default_seed=seed)
 
         log.info("Apply weights policy: " + str(weighting_policy))
         df = weighting_policy.generate_weights(df)
@@ -729,12 +754,14 @@ class ACEDataset:
             self.fitting_data["train"] = True
             self.test_data["train"] = False
             joint_df = pd.concat([self.fitting_data, self.test_data], axis=0).reset_index(drop = True)
-            joint_df = apply_weights(joint_df, self.weighting_policy_spec, self.ignore_weights)
+            joint_df = apply_weights(joint_df, self.weighting_policy_spec, self.ignore_weights,
+                                     seed=self.data_config.get("seed"))
             self.fitting_data = joint_df.query("train").reset_index(drop=True)
             self.test_data = joint_df.query("~train").reset_index(drop=True)
             # self.test_data = apply_weights(self.test_data, self.weighting_policy_spec, self.ignore_weights)
         else:
-            self.fitting_data = apply_weights(self.fitting_data, self.weighting_policy_spec, self.ignore_weights)
+            self.fitting_data = apply_weights(self.fitting_data, self.weighting_policy_spec, self.ignore_weights,
+                                              seed=self.data_config.get("seed"))
 
         # decrease augmented weights
         aug_factor = self.data_config.get("aug_factor", 1e-4)
@@ -744,6 +771,9 @@ class ACEDataset:
         # normalize
         normalize_energy_forces_weights(self.fitting_data)
         normalize_energy_forces_weights(self.test_data)
+        for d in (self.fitting_data, self.test_data):
+            if d is not None and SOURCE_INDEX_COLUMN in d.columns:
+                d.drop(columns=SOURCE_INDEX_COLUMN, inplace=True)
 
     def load_dataset(self, filenames):
         """Load multiple dataframes and concatenate it into one"""
@@ -757,6 +787,7 @@ class ACEDataset:
                 log.info(f" {len(df)} structures found")
                 if "name" not in df.columns:
                     df["name"] = fname + ":" + df.index.map(str)
+                df[SOURCE_INDEX_COLUMN] = df.index
                 dfs.append(df)
             tot_df = pd.concat(dfs, axis=0).reset_index(drop=True)
         else:  # if ref_df is still not loaded, try to query from DB

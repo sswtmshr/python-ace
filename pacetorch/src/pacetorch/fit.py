@@ -44,6 +44,17 @@ NUMPY_OPTIMIZERS = ["BFGS", "L-BFGS-B", "CG"]
 TORCH_OPTIMIZERS = ["Adam", "SGD"]
 
 
+def _data_signature(df):
+    """hash of the structures' names, sizes and energies, in order"""
+    import hashlib
+    h = hashlib.sha1()
+    for col in ("name", "NUMBER_OF_ATOMS", "energy_corrected"):
+        if col in df.columns:
+            h.update(np.asarray(df[col].astype(str).values).astype("U").tobytes())
+    h.update(str(len(df)).encode())
+    return h.hexdigest()
+
+
 def _voigt_residual(s_pred, s_ref):
     ds = s_pred.reshape(-1, 3, 3) - s_ref.reshape(-1, 3, 3)
     return np.stack([ds[:, 0, 0], ds[:, 1, 1], ds[:, 2, 2], ds[:, 1, 2], ds[:, 0, 2], ds[:, 0, 1]], axis=1)
@@ -118,13 +129,19 @@ class FitTorchPotential:
         """run a callback on rank 0 only; a StopIteration it raises (early stopping) stops every rank"""
         if not self._dist():
             return fn(*args, **kwargs)
-        stop = None
+        stop, err = None, None
         if mpi.is_root():
             try:
                 fn(*args, **kwargs)
             except StopIteration as e:
                 stop = str(e) or "stop"
-        stop = mpi.bcast(stop)
+            except Exception as e:  # noqa: BLE001 - any other error: every rank must leave, not wait in a collective
+                err = e
+        stop, failed = mpi.bcast((stop, repr(err) if err is not None else None))
+        if err is not None:
+            raise err
+        if failed is not None:
+            raise RuntimeError("MPI rank 0 failed in a callback: {}".format(failed))
         if stop is not None:
             raise StopIteration(stop)
 
@@ -147,6 +164,11 @@ class FitTorchPotential:
             from pacetorch import check_shared_devices
             check_shared_devices(self.tensorpot.device, mpi)
         self.data_df = df[df["tp_atoms"].notna()].reset_index(drop=True)
+        if self._dist():   # every rank prepared the data itself: it must be the same data in the same order
+            sig = _data_signature(self.data_df)
+            if sig != mpi.bcast(sig if mpi.is_root() else None):
+                raise RuntimeError("MPI rank {}: training data differ from rank 0 (structure order or content); "
+                                   "check that data preparation is deterministic (seeds)".format(mpi.rank()))
         t = time.time()
         np_batches = batching_data(self.data_df, batch_size=batch_size)
         self.n_batches = len(np_batches)
@@ -174,6 +196,8 @@ class FitTorchPotential:
         elif len(coefs) != self.ncoefs:
             raise ValueError("Number of provided coefficients {} != {} in the model".format(len(coefs), self.ncoefs))
         coefs = np.asarray(coefs, dtype=np.float64)
+        if self._dist():   # identical starting point on every rank
+            coefs = mpi.bcast(coefs if mpi.is_root() else None)
         self._last_x = coefs.copy()
 
         t0 = time.time()
@@ -206,24 +230,33 @@ class FitTorchPotential:
             self.res_opt = res_opt
             self.fit_coefs = np.asarray(res_opt.x)
             self.tensorpot.potential.set_coefs(self.fit_coefs)
-            self.process_test_metric()
+            try:
+                self.process_test_metric()
+            except StopIteration as e:   # early stopping triggered by this last test evaluation: the fit is over anyway
+                log.info("Early stopping condition met at the final test evaluation: {}".format(e))
         elif optimizer in TORCH_OPTIMIZERS:
+            if self._dist():
+                raise ValueError("optimizer {} is not supported with PACEMAKER_MPI (each rank would step on its own "
+                                 "batches); use BFGS, L-BFGS-B or CG".format(optimizer))
             c = self.tensorpot.potential
             c.set_coefs(coefs)
             opt_cls = torch.optim.Adam if optimizer == "Adam" else torch.optim.SGD
             lr = float((options or {}).get("learning_rate", 1e-3))
             param = c.coefs.detach().clone().requires_grad_(True)
             opt = opt_cls([param], lr=lr)
-            for _ in range(niter):
-                order = np.random.permutation(len(batches))
-                for i in order:
-                    c.set_coefs(param.detach().cpu().numpy())
-                    _, g, _, _, _ = self.tensorpot.loss_and_grad(batches[i])
-                    param.grad = g.detach().clone()
-                    opt.step()
-                x = param.detach().cpu().numpy()
-                self.fit_func(x, batches)
-                self.callback(x)
+            try:
+                for _ in range(niter):
+                    order = np.random.permutation(len(batches))
+                    for i in order:
+                        c.set_coefs(param.detach().cpu().numpy())
+                        _, g, _, _, _ = self.tensorpot.loss_and_grad(batches[i])
+                        param.grad = g.detach().clone()
+                        opt.step()
+                    x = param.detach().cpu().numpy()
+                    self.fit_func(x, batches)
+                    self.callback(x)
+            except StopIteration as e:
+                log.info("Optimization stopped by callback: {}".format(e))
             self.fit_coefs = param.detach().cpu().numpy()
             self.res_opt = OptimizeResult(x=self.fit_coefs, success=True, nit=niter, fun=self.last_loss)
             c.set_coefs(self.fit_coefs)
@@ -373,7 +406,13 @@ class FitTorchPotential:
 
     # ------------------------------------------------------------------------------------------- prediction
     def predict(self, datadf=None):
-        df = self.data_df if datadf is None else datadf[datadf["tp_atoms"].notna()].reset_index(drop=True)
+        if datadf is not None and datadf["tp_atoms"].isna().any():
+            # as the TF backend: rows without a neighbour list are dropped from the caller's frame, so predictions and
+            # the frame stay aligned (pacemaker's predict_and_save builds its result on datadf.index)
+            log.warning("predict: {} structures without neighbour list are dropped".format(
+                int(datadf["tp_atoms"].isna().sum())))
+            datadf.drop(index=datadf.index[datadf["tp_atoms"].isna()], inplace=True)
+        df = self.data_df if datadf is None else datadf
         out = {k: [] for k in ("energy_pred", "forces_pred", "stress_pred", "de", "de_pa", "df", "total_na")}
         for b in batching_data(df, batch_size=self.batch_size):
             db = self.tensorpot.device_batch(b)

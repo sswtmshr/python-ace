@@ -38,7 +38,7 @@ except ImportError:  # pragma: no cover - private API moved: fall back to the pu
 
     def _line_search_wolfe12(f, fprime, xk, pk, gfk, old_fval, old_old_fval, **kw):
         r = _ls(f, fprime, xk, pk, gfk, old_fval, old_old_fval, amin=kw.get("amin", 1e-100),
-                amax=kw.get("amax", 1e100))
+                amax=kw.get("amax", 1e100), c1=kw.get("c1", 1e-4), c2=kw.get("c2", 0.9))
         if r[0] is None:
             raise _LineSearchError()
         return r
@@ -97,10 +97,25 @@ class _InvHessian:
                 self.torch = None
         self.H = np.array(H, dtype=np.float64, order="C") if H is not None else np.eye(N)
 
+    def _to_cpu(self, e):
+        """GPU out of memory (or any GPU error) on rank 0 alone must not reach fitadapter's collective OOM handling:
+        continue on the CPU"""
+        log.warning("BFGS: inverse Hessian moved to the CPU (%s)", e)
+        self.H = self.H.cpu().numpy()
+        self.torch = None
+
     def dot(self, v):
         if self.torch is not None:
-            return (self.H @ self.torch.as_tensor(v, device=self.dev)).cpu().numpy()
+            try:
+                return (self.H @ self.torch.as_tensor(v, device=self.dev)).cpu().numpy()
+            except RuntimeError as e:
+                self._to_cpu(e)
         return self.H.dot(v)
+
+    def finite(self):
+        if self.torch is not None:
+            return bool(self.torch.isfinite(self.H).all())
+        return bool(np.all(np.isfinite(self.H)))
 
     def update(self, s, y):
         """BFGS: H+ = H - rho (s (Hy)^T + (Hy) s^T) + (rho^2 y^T H y + rho) s s^T  =  H + u s^T + s u^T with
@@ -108,11 +123,14 @@ class _InvHessian:
         ys = float(np.dot(y, s))
         rho = 1000.0 if ys == 0.0 else 1.0 / ys
         if self.torch is not None:
-            st, yt = (self.torch.as_tensor(v, device=self.dev) for v in (s, y))
-            Hy = self.H @ yt
-            u = 0.5 * (rho * rho * float(self.torch.dot(yt, Hy)) + rho) * st - rho * Hy
-            self.H.addr_(u, st).addr_(st, u)
-            return
+            try:
+                st, yt = (self.torch.as_tensor(v, device=self.dev) for v in (s, y))
+                Hy = self.H @ yt
+                u = 0.5 * (rho * rho * float(self.torch.dot(yt, Hy)) + rho) * st - rho * Hy
+                self.H.addr_(u, st).addr_(st, u)
+                return
+            except RuntimeError as e:   # nothing was modified unless addr_ itself failed midway: recompute on CPU
+                self._to_cpu(e)
         from scipy.linalg.blas import dger
         Hy = self.H.dot(y)
         u = 0.5 * (rho * rho * float(np.dot(y, Hy)) + rho) * s - rho * Hy
@@ -126,45 +144,70 @@ class _InvHessian:
 
 # scipy BFGS options this implementation honours (plus its own); anything else -> use_scipy() says why
 _OWN = {"checkpoint", "checkpoint_every", "checkpoint_min_s", "deadline", "margin", "device"}
-_SAME_AS_SCIPY = {"gtol", "norm", "maxiter", "disp", "eps", "finite_diff_rel_step"}   # eps/finite_diff: unused, jac given
+_SAME_AS_SCIPY = {"gtol", "norm", "maxiter", "disp", "xrtol", "c1", "c2",
+                  "eps", "finite_diff_rel_step", "workers"}   # eps/finite_diff/workers: unused, the gradient is given
+_paused = [False]
 
 
 def use_scipy(options):
-    """Options of an input written for stock pacemaker (scipy BFGS) that only scipy implements (c1, c2, xrtol,
-    hess_inv0, return_all, ...): the fitters then call scipy.optimize.minimize instead. Returns the offending keys."""
+    """Options of an input written for stock pacemaker (scipy BFGS) that only scipy implements (hess_inv0,
+    return_all, ...): the fitters then call scipy.optimize.minimize instead. Returns the offending keys."""
     return sorted(set(options or {}) - _OWN - _SAME_AS_SCIPY)
+
+
+def was_paused():
+    """True if the last minimize_bfgs paused for the allocation deadline (the fit is not finished)"""
+    return _paused[0]
+
+
+def _vecnorm(x, ord=2):   # scipy.optimize._optimize.vecnorm
+    if ord == np.inf:
+        return np.amax(np.abs(x))
+    if ord == -np.inf:
+        return np.amin(np.abs(x))
+    return np.sum(np.abs(x) ** ord, axis=0) ** (1.0 / ord)
 
 
 def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
     """fun(x, *args) -> (loss, gradient). `tag` identifies the loss (pacemaker: kappa); a checkpoint written for a
-    different tag or size is ignored. Returns a scipy OptimizeResult."""
+    different tag or size is ignored. Returns a scipy OptimizeResult; status/message as scipy's BFGS (0 success,
+    1 maxiter, 2 precision loss, 3 NaN) plus 9 = paused for the allocation deadline (was_paused())."""
     o = dict(options or {})
     gtol = float(o.get("gtol", 1e-5))
     norm = o.get("norm", np.inf)
+    xrtol = float(o.get("xrtol", 0))
+    c1, c2 = float(o.get("c1", 1e-4)), float(o.get("c2", 0.9))
+    disp = bool(o.get("disp", False))
     path = o.get("checkpoint", os.environ.get("PACE_BFGS_CKPT"))
-    every = int(o.get("checkpoint_every", os.environ.get("PACE_BFGS_EVERY", 10)))
+    every = max(1, int(o.get("checkpoint_every", os.environ.get("PACE_BFGS_EVERY", 10)) or 1))
     min_s = float(o.get("checkpoint_min_s", os.environ.get("PACE_BFGS_MIN_S", 60)))
     device = o.get("device")
     deadline = float(o.get("deadline", os.environ.get("PACE_DEADLINE", "inf")))
     margin = float(o.get("margin", os.environ.get("PACE_MARGIN", 240)))
     dist = _mpi.is_distributed()
     root = _mpi.is_root()
+    _paused[0] = False
+    if np.isfinite(deadline) and not path:
+        log.warning("BFGS: PACE_DEADLINE is set but there is no checkpoint (fit: bfgs_checkpoint): the fit will not "
+                    "pause before the deadline")
+        deadline = float("inf")
 
     x0 = np.asarray(x0, dtype=np.float64).flatten()
     N = len(x0)
-    maxiter = int(o.get("maxiter") or N * 200)
+    maxiter = o.get("maxiter")
+    maxiter = N * 200 if maxiter is None else int(maxiter)
     m = _Memo(fun, args)
     old_fval = m.f(x0)
     gfk = m.fprime(x0)
     old_old_fval = old_fval + np.linalg.norm(gfk) / 2
     H, k_total, f_old_ck = None, 0, None
-    # rank 0 alone reads the checkpoint and broadcasts it: replicated optimisers must start bit-identical
+    # rank 0 alone reads the checkpoint (and holds H)
     if path and root and os.path.exists(path):
         try:
             ck = np.load(path)
             ck_tag = float(ck["kappa"])
             same = (np.isnan(tag) and np.isnan(ck_tag)) or abs(ck_tag - tag) < 1e-12
-            if ck["H"].shape == (N, N) and same:
+            if ck["H"].shape == (N, N) and same and np.all(np.isfinite(ck["H"])):
                 H = np.array(ck["H"])
                 k_total = int(ck["k"])
                 dx = float(np.max(np.abs(ck["x"] - x0)))
@@ -173,7 +216,8 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
                 log.info("BFGS: inverse Hessian loaded from %s (N=%d, %d iterations so far, max|x - x_ckpt| = %.2e)",
                          path, N, k_total, dx)
             else:
-                log.info("BFGS: %s ignored (N %s vs %d, tag %s vs %s): H = I", path, ck["H"].shape, N, ck_tag, tag)
+                log.info("BFGS: %s ignored (N %s vs %d, tag %s vs %s, or not finite): H = I", path, ck["H"].shape, N,
+                         ck_tag, tag)
         except Exception as e:  # noqa: BLE001 - unreadable checkpoint: plain start
             log.warning("BFGS: could not read %s (%s): H = I", path, e)
     if dist:
@@ -186,11 +230,14 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
     if root and os.path.exists(PAUSE_FLAG):
         os.remove(PAUSE_FLAG)
 
-    def vnorm(v):
-        return np.amax(np.abs(v)) if norm == np.inf else np.sum(np.abs(v) ** norm) ** (1.0 / norm)
+    def save():
+        nonlocal last_save
+        if path and root and np.isfinite(old_fval) and np.all(np.isfinite(xk)) and H.finite():
+            _save(path, H, xk, old_fval, old_old_fval, k_total + k, tag)
+            last_save = time.time()
 
     xk, k, warnflag, paused = x0, 0, 0, False
-    gnorm = vnorm(gfk)
+    gnorm = _vecnorm(gfk, ord=norm)
     try:
         while gnorm > gtol and k < maxiter:
             pk = -H.dot(gfk) if root else None
@@ -198,7 +245,7 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
                 pk = _mpi.bcast(pk)
             try:
                 alpha_k, fc, gc, old_fval, old_old_fval, gfkp1 = _line_search_wolfe12(
-                    m.f, m.fprime, xk, pk, gfk, old_fval, old_old_fval, amin=1e-100, amax=1e100)
+                    m.f, m.fprime, xk, pk, gfk, old_fval, old_old_fval, amin=1e-100, amax=1e100, c1=c1, c2=c2)
             except _LineSearchError:
                 warnflag = 2
                 break
@@ -208,21 +255,26 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
                 gfkp1 = m.fprime(xk)
             yk = gfkp1 - gfk
             gfk = gfkp1
+            k += 1
+            gnorm = _vecnorm(gfk, ord=norm)
+            converged = gnorm <= gtol or alpha_k * _vecnorm(pk) <= xrtol * (xrtol + _vecnorm(xk))
+            finite = np.isfinite(old_fval) and np.all(np.isfinite(gfk))
+            # H update before the callback (scipy order: after it): a checkpoint written on early stopping then holds
+            # the curvature of every accepted step; same iterates
+            if root and finite and not converged:
+                H.update(sk, yk)
             if callback is not None:
                 callback(xk)
-            k += 1
-            gnorm = vnorm(gfk)
-            if gnorm <= gtol or not np.isfinite(old_fval):
-                warnflag = 0 if gnorm <= gtol else 2
+            if converged:
                 break
-            if root:
-                H.update(sk, yk)
+            if not finite:
+                warnflag = 2
+                break
             stop = time.time() > deadline - margin
             if dist:
                 stop = bool(_mpi.bcast(stop if root else None))
-            if path and root and (stop or (k % every == 0 and time.time() - last_save >= min_s)):
-                _save(path, H, xk, old_fval, old_old_fval, k_total + k, tag)
-                last_save = time.time()
+            if stop or (k % every == 0 and time.time() - last_save >= min_s):
+                save()
             if stop:
                 paused = True
                 if root:
@@ -233,19 +285,25 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
                          k_total + k)
                 break
     except StopIteration:   # early stopping in a callback: keep the curvature, then let the fitter handle it
-        if path and root:
-            _save(path, H, xk, old_fval, old_old_fval, k_total + k, tag)
+        save()
         raise
 
     if paused:
-        msg = "paused for allocation end"
+        warnflag, msg = 9, "paused for allocation end"
     elif warnflag == 2:
         msg = "Desired error not necessarily achieved due to precision loss."
     elif k >= maxiter:
         warnflag, msg = 1, "Maximum number of iterations has been exceeded."
+    elif np.isnan(gnorm) or np.isnan(old_fval) or np.isnan(xk).any():
+        warnflag, msg = 3, "NaN result encountered."
     else:
         msg = "Optimization terminated successfully."
-    if path and root and not paused:
-        _save(path, H, xk, old_fval, old_old_fval, k_total + k, tag)
-    return OptimizeResult(fun=old_fval, jac=gfk, hess_inv=H.numpy() if root else None, nfev=m.nfev, njev=m.nfev, status=warnflag,
-                          success=(warnflag == 0), message=msg, x=xk, nit=k)
+    _paused[0] = paused
+    if not paused:
+        save()
+    if disp and root:
+        print(("         " if warnflag == 0 else "Warning: ") + msg)
+        print("         Current function value: %f\n         Iterations: %d\n         Function evaluations: %d"
+              % (old_fval, k, m.nfev))
+    return OptimizeResult(fun=old_fval, jac=gfk, hess_inv=H.numpy() if root else None, nfev=m.nfev, njev=m.nfev,
+                          status=warnflag, success=(warnflag == 0), message=msg, x=xk, nit=k)

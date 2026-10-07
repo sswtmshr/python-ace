@@ -44,18 +44,9 @@ def is_reproducible():
 
 
 def shard_mode():
-    """How the per-iteration work is split across ranks:
-      'batchlist' (default) -- each rank owns a contiguous slice of the batch LIST.
-                               Per-GPU memory unchanged (one full batch still
-                               lands on one GPU).
-      'inbatch'             -- every rank sees every batch, but only its contiguous
-                               slice of that batch's STRUCTURES. Per-GPU memory
-                               ~1/world_size -> lets `batch_size` go up to ~Wx.
-    inbatch makes W times more, smaller calls per rank; it keeps up with batchlist
-    only when each GPU still gets ~100 structures per call.
-    """
-    m = os.environ.get("PACEMAKER_MPI_SHARD", "batchlist").strip().lower()
-    return m if m in ("batchlist", "inbatch") else "batchlist"
+    """How the per-iteration work is split across ranks. Only 'batchlist' is implemented by the torch backend (each
+    rank owns a contiguous slice of the batch list); the TensorFlow backend's 'inbatch' mode is not."""
+    return "batchlist"
 
 
 # ------------------------------------------------------------ lazy communicator
@@ -73,11 +64,9 @@ def _comm():
         try:
             from mpi4py import MPI
         except Exception as e:  # pragma: no cover
-            if not _warned:
-                print("[pacemaker.mpi] PACEMAKER_MPI=1 but mpi4py import failed "
-                      "({}); running single-process.".format(e))
-                _warned = True
-            return None
+            # under srun -n W a silent single-process fallback would run W independent fits writing the same files
+            raise RuntimeError("PACEMAKER_MPI=1 but mpi4py cannot be imported ({}); unset PACEMAKER_MPI for a "
+                               "single-process run".format(e)) from e
         _comm_cache = MPI.COMM_WORLD
         if _comm_cache.Get_size() > 1:
             _install_abort_on_exception(_comm_cache)

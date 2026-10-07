@@ -191,7 +191,7 @@ setup(
                                           build_ext=CMakeBuild)),
     zip_safe=False,
     url='https://github.com/ICAMS/python-ace',
-    install_requires=['numpy<3',
+    install_requires=['numpy<2',   # the compiled extensions / TF 2.21 env were built against numpy 1.x
                       'ase',
                       'pandas>=2,<3',
                       'ruamel.yaml',

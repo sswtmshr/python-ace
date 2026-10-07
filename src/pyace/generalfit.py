@@ -19,6 +19,7 @@ from pyace.multispecies_basisextension import extend_multispecies_basis, expand_
 from pyace.const import *
 from pyace.fitadapter import FitBackendAdapter
 from pyace.preparedata import ACEDataset
+from pyace.bfgs import was_paused as _bfgs_paused
 from pyace.lossfuncspec import LossFunctionSpecification
 from pyace.metrics_aggregator import MetricsAggregator
 from pyace.utils.utils import complement_min_dist_dict
@@ -510,6 +511,9 @@ class GeneralACEFit:
                 break
 
             current_bbasisconfig = self.cycle_fitting(current_bbasisconfig)
+            if _bfgs_paused():
+                log.info("BFGS paused before the allocation deadline: no further ladder steps in this run")
+                break
 
             if "_fit_cycles" in current_bbasisconfig.metadata:
                 del current_bbasisconfig.metadata["_fit_cycles"]
@@ -606,6 +610,10 @@ class GeneralACEFit:
                 "Select best fit #{} among all available ({})".format(best_ind + 1, len(fitting_attempts_list)))
             current_bbasisconfig = fitting_attempts_list[best_ind][1].copy()
 
+            if _bfgs_paused():
+                log.info("BFGS paused before the allocation deadline: no further fit cycles in this run (the BFGS "
+                         "checkpoint resumes the fit)")
+                break
             if finished_fit_cycles < fit_cycles and randomize_func_coeffs_abs_sigma > 0:
                 current_bbasisconfig = self.randomize_func_coeffs(current_bbasisconfig, self.trainable_parameters_dict,
                                                                   randomize_func_coeffs_abs_sigma)

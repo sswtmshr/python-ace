@@ -30,9 +30,57 @@ def cutoff_func_cos(x, rcut):
 
 
 def cutoff_func_poly(r, rin, delta):
-    x = 1 - 2 * (1 + (r - rin) / (delta + 1e-8))
+    """C++ cutoff_func_poly: 1 for r <= rin - delta, 0 for r >= rin, smooth (C2) in between (exact delta; TF added
+    1e-8 to it)"""
+    if delta <= 0:
+        return torch.where(r < rin, torch.ones_like(r), torch.zeros_like(r))
+    x = 1 - 2 * (1 + (r - rin) / delta)
     f = 7.5 * (x / 4 - x ** 3 / 6 + x ** 5 / 20)
-    return torch.where(rin < r, torch.zeros_like(r), torch.where(r < rin - delta, torch.ones_like(r), 0.5 * (1 + f)))
+    return torch.where(rin <= r, torch.zeros_like(r), torch.where(r <= rin - delta, torch.ones_like(r), 0.5 * (1 + f)))
+
+
+# ZBL universal screened nuclear repulsion, as the C++ evaluator (ace_radial.cpp ACEZBL / ACERadialFunctions::ZBL)
+_ZBL_K = 14.399645351950543
+_ZBL_C = (0.18175, 0.50986, 0.28022, 0.02817)
+_ZBL_E = (-3.19980, -0.94229, -0.40290, -0.20162)
+
+
+def _zbl_phi_np(x):
+    """phi, phi', phi'' at a scalar x (setup of the switching polynomial)"""
+    p = sum(c * math.exp(e * x) for c, e in zip(_ZBL_C, _ZBL_E))
+    dp = sum(c * e * math.exp(e * x) for c, e in zip(_ZBL_C, _ZBL_E))
+    d2p = sum(c * e * e * math.exp(e * x) for c, e in zip(_ZBL_C, _ZBL_E))
+    return p, dp, d2p
+
+
+def zbl(r, Zi, Zj, cut_out, cut_in, prefactor):
+    """pair energy: prefactor K/2 Zi Zj (phi(r/a)/r + S(r)) * cutoff_func_poly(r, cut_out, cut_out - cut_in), S the
+    C2 shift that makes it vanish at cut_out (C++ ZBL; ZBL acts on every pair r < cut_out)"""
+    a = 0.46850 / (Zi ** 0.23 + Zj ** 0.23)
+    p, dp, d2p = _zbl_phi_np(cut_out / a)
+    Ec = p / cut_out
+    dEc = -p / cut_out ** 2 + dp / (a * cut_out)
+    d2Ec = 2 * p / cut_out ** 3 - 2 * dp / (a * cut_out ** 2) + d2p / (a * a * cut_out)
+    dr = cut_out - cut_in
+    A = (-3 * dEc + dr * d2Ec) / dr ** 2
+    B = (2 * dEc - dr * d2Ec) / dr ** 3
+    C = -Ec + 0.5 * dr * dEc - dr * dr * d2Ec / 12
+    x = r / a
+    E = sum(c * torch.exp(e * x) for c, e in zip(_ZBL_C, _ZBL_E)) / r
+    t = torch.clamp(r - cut_in, min=0.)
+    S = torch.where(r >= cut_out, torch.zeros_like(r), A / 3 * t ** 3 + B / 4 * t ** 4 + C)
+    cr = prefactor * _ZBL_K / 2 * Zi * Zj * (E + S) * cutoff_func_poly(r, cut_out, dr)
+    return torch.where(r < cut_out, cr, torch.zeros_like(cr))
+
+
+def core_repulsion_exp(r, pre, lmbda, rcut):
+    """C++ radcore without the inner switch: |pre| exp(-|lambda| r^2) / r * (1 + cos(pi r / rcut)) / 2 for
+    |lambda| r^2 < 50 and r < rcut, else 0"""
+    pre, lmbda = abs(pre), abs(lmbda)
+    lr2 = lmbda * r * r
+    ok = (lr2 < 50.) & (r < rcut)
+    cr = pre * torch.exp(-torch.where(ok, lr2, torch.zeros_like(lr2))) / r * 0.5 * (1. + torch.cos(math.pi * r / rcut))
+    return torch.where(ok, cr, torch.zeros_like(cr))
 
 
 def _sinc(x):
@@ -70,14 +118,15 @@ def radial_function(d, nfunc, ftype, cutoff, lmbda, dcut=0.):
             gk = gk * taper.unsqueeze(1)
         return gk
     if ftype == "ChebPow":
-        d_ch = 2.0 * (1.0 - torch.abs(1.0 - d / cutoff) ** lmbda) - 1.0
+        # clamp: |1 - d/c|^lambda has an infinite derivative at d = c for lambda < 1 (0 * inf = NaN through where)
+        d_ch = 2.0 * (1.0 - torch.clamp(torch.abs(1.0 - d / cutoff), min=1e-300) ** lmbda) - 1.0
         cheb = 0.5 - 0.5 * chebvander(d_ch, nfunc + 1)[:, 1:]
         return torch.where((d < cutoff).unsqueeze(1), cheb, torch.zeros_like(cheb))
     if ftype in ("SBessel", "TEST_SBessel"):
         y = simplified_bessel(d, cutoff, nfunc)
         return torch.where((d < cutoff).unsqueeze(1), y, torch.zeros_like(y))
     if ftype == "TEST_LegendrePow":
-        x = 2.0 * (1.0 - torch.abs(1.0 - d / cutoff) ** lmbda) - 1.0
+        x = 2.0 * (1.0 - torch.clamp(torch.abs(1.0 - d / cutoff), min=1e-300) ** lmbda) - 1.0
         leg = [torch.ones_like(x), x]
         for i in range(2, nfunc + 1):
             leg.append(((2 * i - 1) * leg[i - 1] * x - (i - 1) * leg[i - 2]) / i)

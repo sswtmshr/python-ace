@@ -134,3 +134,19 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
   Upstream inputs run unchanged: unknown `fit: loss:` keys warn, scipy-only options go to scipy.
 - Effect: 0.52 s -> 3 ms (GPU) / 0.14 s (CPU) per update. A whole BFGS step, 4 A100s, N = 5640: 2.267 -> 1.992 s,
   same final loss to 12 digits (job 59477031).
+
+### 16. Audit fixes (2026-10-07)
+
+A four-part independent audit (model, fit loop and MPI, data, packaging); about 40 bugs, upstream's and this fork's.
+
+| finding | effect | after |
+|---|---|---|
+| core repulsion / inner cutoff (distance, density, zbl) not as in C++ | up to 1.2 eV/at, 9.6 eV/A (distance); 7 eV/at inside r_in (zbl) | C++ formulas |
+| Triton kernels launched on the current GPU, not the tensors' GPU | wrong or racy results on cuda:k, k > 0 | tensors' device |
+| BFGS: NaN reported as success; `maxiter: 0` ran 200N iterations | silent misbehaviour | fixed |
+| EnergyBasedWeightingPolicy without a seed | MPI ranks disagree on the data | top-level seed |
+| external weights merged on a renumbered index | weights on wrong rows | file index |
+| test set without stress labels | fit aborted | no stress metrics |
+
+- pacemaker now stops with an error for `evaluator: tensorpot` under MPI.
+- Zero core-repulsion terms are skipped: 7.69 -> 7.40 s on one (slower) node.

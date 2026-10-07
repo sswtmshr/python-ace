@@ -1,7 +1,23 @@
 """pacetorch: PyTorch backend for pacemaker (linear/FS B-basis ACE), a drop-in for TensorPotential 0.2."""
 import logging
 
-__version__ = "0.2.0"
+
+
+def _git_version(default):
+    """`git describe` of this checkout (editable installs: the tag the running code is at, e.g. v0.2.3 or
+    v0.2.3-2-gabc1234 for dev), else the packaged version"""
+    import os
+    import subprocess
+    try:
+        d = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", d, "describe", "--tags", "--dirty"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=5, check=True, universal_newlines=True).stdout.strip()
+        return out.lstrip("v") or default
+    except Exception:  # noqa: BLE001 - no git, not a checkout: packaged version
+        return default
+
+
+__version__ = _git_version("0.2.3")
 log = logging.getLogger(__name__)
 
 
@@ -23,7 +39,10 @@ def select_device(gpu_config=None):
     import torch
     cfg = dict(gpu_config or {})
     if cfg.get("device"):
-        return torch.device(cfg["device"])
+        dev = torch.device(cfg["device"])
+        if dev.type == "cuda" and dev.index is not None:
+            torch.cuda.set_device(dev)
+        return dev
     ind = int(cfg.get("gpu_ind", 0))
     if ind < 0:
         return torch.device("cpu")
@@ -40,6 +59,8 @@ def select_device(gpu_config=None):
         dist, lrank = False, 0
     i = choose_index(n, ind, dist, lrank)
     dev = torch.device(kind, i)
+    if kind == "cuda":   # the current device must be the model's: Triton kernels launch on the current device
+        torch.cuda.set_device(dev)
     if dist:
         log.info("[MPI rank {} / local {}] {} visible {} device(s) -> {}".format(mpi.rank(), lrank, n, kind, dev))
     return dev

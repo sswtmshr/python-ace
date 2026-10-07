@@ -21,7 +21,8 @@ import torch
 import os
 
 from pacetorch import _kernels
-from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding, radial_function
+from pacetorch.functions import (SphericalHarmonics, core_repulsion_exp, cutoff_func_poly, embedding,
+                                 radial_function, zbl)
 
 # A-basis: segmented outer products with hand-written derivatives (_SegOuter), run by fused Triton kernels on a GPU
 # (_kernels.py; PACETORCH_TRITON=0 forces the torch formulation, which is also what runs on CPU).
@@ -120,6 +121,12 @@ class _GatherContract(torch.autograd.Function):
             for k, o in zip(need, _GatherContract.apply(G, ctx.seg, tuple(nd), *nw)):
                 gws[k] = o
         return (gG, None, None, *gws)
+
+
+def _poly_desc(x, delta):
+    """cutoff_func_poly(x, delta, delta) for 0 < x < delta with a per-atom tensor delta"""
+    t = 1 - 2 * (1 + (x - delta) / delta)
+    return 0.5 * (1 + 7.5 * (t / 4 - t ** 3 / 6 + t ** 5 / 20))
 
 
 def _prefix_tree(ranks, ncols):
@@ -288,12 +295,21 @@ class ACE:
                 radbase=bs.radbasename, lmbda=float(bs.radparameters[0]),
                 rcut_in=float(bs.rcut_in), dcut_in=float(bs.dcut_in),
                 prehc=float(bs.prehc), lambdahc=float(bs.lambdahc),
+                Zi=_Z[self.elem_names[e]], Zj=_Z[self.elem_names[mu]],
                 crad=self.bond_to_slice[c], nd=self.embed_spec[e].ndensity,
                 r1_idx=torch.tensor(coefs_r1[c], dtype=torch.long), r1_n=torch.tensor(r1_n[c], dtype=torch.long),
                 nl_idx=torch.tensor(nl_idx, dtype=torch.long), lm_idx=torch.tensor(lm_idx, dtype=torch.long),
                 sh=SphericalHarmonics(lmax_used) if ch else None, has_A=bool(ch),
                 L=lmax_used,
                 n_l=n_l, o_r=torch.tensor(o_r, dtype=torch.long), o_i=torch.tensor(o_i, dtype=torch.long)))
+
+        # inner cutoff / core repulsion: one type for the whole potential, as in the C++ evaluator
+        types = {str(self.bond_specs[c].inner_cutoff_type) for c in self.bond_combs}
+        if len(types) > 1:
+            raise ValueError("bonds have different inner_cutoff_type {}; the C++ evaluator uses one".format(types))
+        self.inner_cutoff_type = types.pop() if types else "distance"
+        if self.inner_cutoff_type not in ("distance", "density", "zbl"):
+            raise ValueError("inner_cutoff_type {} is not supported".format(self.inner_cutoff_type))
 
         self.coefs = torch.tensor(coefs, dtype=torch.float64)
         self.to(device)
@@ -433,6 +449,9 @@ class ACE:
         ncomb = len(self.bonds)
         zero_nat = torch.zeros(nat, dtype=torch.float64, device=dev)
         phi_cols = [zero_nat] * ncomb
+        if self.inner_cutoff_type == "zbl":
+            zmin = torch.full((nat,), float(self.rcut), dtype=torch.float64, device=dev)   # C++: dmin = cutoffmax
+            zpairs = []
 
         for ci, B in enumerate(self.bonds):
             P = idx["pairs"][ci]
@@ -441,12 +460,32 @@ class ACE:
             e, mu = B["c"]
             d = d_all.index_select(0, P["p"])
             rij = r_ij.index_select(0, P["p"])
-            # core repulsion (summed per central atom and bond type, as in TF)
-            fcp = cutoff_func_poly(d, B["rcut_in"], B["dcut_in"])
-            phi = B["prehc"] * torch.exp(-B["lambdahc"] * d ** 2) / d * fcp
-            phi_cols[ci] = zero_nat.index_add(0, P["central"], phi)
-            # radial basis g_k(r), damped inside the inner cutoff
-            g = radial_function(d, B["nradbase"], B["radbase"], B["rcut"], B["lmbda"], B["dcut"]) * (1 - fcp).unsqueeze(1)
+            # core repulsion and inner cutoff, as the C++ evaluator (ace_radial.cpp radbase/radcore/ZBL,
+            # ace_evaluator.cpp): per pair cr, summed per atom into rho_core
+            ict, cin, dcin = self.inner_cutoff_type, B["rcut_in"], B["dcut_in"]
+            if ict == "zbl":
+                cr = zbl(d, B["Zi"], B["Zj"], B["rcut"], B["rcut"] - B["dcut"], B["prehc"])
+                # transition coordinate: the nearest neighbour relative to r_in - delta_in (within the bond cutoff)
+                dval = torch.where(d < B["rcut"], d - (cin - dcin), torch.full_like(d, float("inf")))
+                zmin = zmin.scatter_reduce(0, P["central"], dval, reduce="amin", include_self=True)
+                zpairs.append((P["central"], dval.detach(), dcin))
+                g_cin = 1.0 if dcin == 0 else 0.0      # C++: "cut_in = dcut_in == 0" for zbl
+            else:
+                cr = None
+                if B["prehc"] != 0 and not (ict == "distance" and cin <= 0):   # else identically zero
+                    cr = core_repulsion_exp(d, B["prehc"], B["lambdahc"], B["rcut"])
+                    if ict == "distance":              # core repulsion only inside r_in
+                        cr = cr * cutoff_func_poly(d, cin, dcin)
+                g_cin = cin
+            if cr is not None:
+                phi_cols[ci] = zero_nat.index_add(0, P["central"], cr)
+            # radial basis g_k(r): zero for r <= r_in - delta_in; smoothly damped up to r_in (distance, zbl);
+            # both are no-ops (skipped) when r_in <= 0 (pair distances are positive)
+            g = radial_function(d, B["nradbase"], B["radbase"], B["rcut"], B["lmbda"], B["dcut"])
+            if g_cin - dcin > 0:
+                g = torch.where((d > g_cin - dcin).unsqueeze(1), g, torch.zeros_like(g))
+            if ict in ("distance", "zbl") and g_cin > 0:
+                g = g * (1 - cutoff_func_poly(d, g_cin, dcin)).unsqueeze(1)
             # rank 1: sum_j g_k, then rho += G @ c_r1; function (n) -> radial basis column n - 1, so a basis with
             # fewer rank-1 functions than nradbase, or in another order, is handled (TF assumed n = 1..nradbase)
             if len(B["r1_idx"]):
@@ -482,6 +521,12 @@ class ACE:
                 blk_i[e][mu] = torch.zeros(ne_, len(B["lm_idx"]), dtype=torch.float64, device=dev).index_add(
                     0, P["central_local"], R * yi.index_select(1, B["lm_idx"]))
 
+        if self.inner_cutoff_type == "zbl":   # delta_in of each atom's nearest pair (the C++ j_min)
+            zdcin = torch.zeros(nat, dtype=torch.float64, device=dev)
+            zm = zmin.detach()
+            for central, dval, dcin in zpairs:
+                hit = dval == zm.index_select(0, central)
+                zdcin = zdcin.index_put((central[hit],), torch.full_like(dval[hit], dcin))
         phi_ac = torch.stack(phi_cols, 1)
         phi_core = phi_ac.sum(1)
         e_atom = torch.zeros(nat, dtype=torch.float64, device=dev)
@@ -500,16 +545,19 @@ class ACE:
             en = 0.
             for p in range(E["nd"]):
                 en = en + E["fs"][2 * p] * embedding(safe[:, p], E["fs"][2 * p + 1], E["npot"])
-            # inner cutoff on the core-repulsion density: mean over the bond types present at the atom (as in TF)
-            phi_e = phi_ac.index_select(0, atoms)
-            fc = []
-            for ci, B in enumerate(self.bonds):
-                rc, drc = E["rho_cut"], E["drho_cut"]
-                x = phi_e[:, ci]
-                fc.append(torch.where(rc <= x, torch.zeros_like(x),
-                                      torch.where(x < rc - drc, torch.ones_like(x), cutoff_func_poly(x, rc, drc))))
-            fc = torch.stack(fc, 1)
-            pres = idx["present"].index_select(0, atoms)              # float 0/1 [nat_e, ncomb]
-            inner = (fc * pres).sum(1) / pres.sum(1)
-            e_atom = e_atom.index_add(0, atoms, en * inner)
-        return e_atom + phi_core
+            rho_core = phi_core.index_select(0, atoms)
+            if self.inner_cutoff_type == "zbl":
+                # E = F fcut + rho_core (1 - fcut), fcut from the nearest neighbour: 1 beyond r_in, 0 inside r_in - dr_in
+                dmin, dc = zmin.index_select(0, atoms), zdcin.index_select(0, atoms)
+                has = dmin < float(self.rcut)                 # C++: no neighbour updated dmin -> fcut = 1
+                x = dc - dmin                                 # transition coordinate = r_in - r_min
+                dc_safe = torch.where(dc > 0, dc, torch.ones_like(dc))
+                fcut = torch.where(x <= 0, torch.ones_like(x),
+                                   torch.where(x >= dc, torch.zeros_like(x), _poly_desc(x, dc_safe)))
+                fcut = torch.where(has, fcut, torch.ones_like(fcut))
+                e_atom = e_atom.index_add(0, atoms, en * fcut + rho_core * (1 - fcut))
+            else:
+                # one cutoff on the summed core-repulsion density (C++ inner_cutoff); TF averaged per-bond-type cutoffs
+                fcut = cutoff_func_poly(rho_core, E["rho_cut"], E["drho_cut"])
+                e_atom = e_atom.index_add(0, atoms, en * fcut + rho_core)
+        return e_atom

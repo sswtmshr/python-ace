@@ -121,7 +121,9 @@ def main(args):
     if _MPI_ON:
         log.info("MPI: %s", _mpi.summary())
         if not _MPI_ROOT:
+            # module loggers set their own DEBUG level, so the root level alone does not silence them
             logging.getLogger().setLevel(logging.ERROR)
+            logging.disable(logging.WARNING)
 
     if not args_parse.verbose_tf:
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
@@ -276,10 +278,9 @@ def main(args):
     if not args_parse.no_predict:
         log.info("Making predictions")
 
-        # if fit was not done - just take target_bbasisconfig
-        target_bbasisconfig = None
-        if args_parse.no_fit:
-            target_bbasisconfig = general_fit.target_bbasisconfig
+        # the potential that was saved (after a fit: the best cycle, with core repulsion set), not whatever
+        # coefficients the backend evaluated last (with fit_cycles > 1 that was the last cycle)
+        target_bbasisconfig = general_fit.target_bbasisconfig
 
         if general_fit.fitting_data is not None:
             log.info("For train data")

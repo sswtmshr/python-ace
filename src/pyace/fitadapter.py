@@ -13,6 +13,7 @@ from pyace.basis import BBasisConfiguration, ACEBBasisSet
 
 from pyace.multispecies_basisextension import compute_bbasisset_train_mask, expand_trainable_parameters
 from pyace.lossfuncspec import LossFunctionSpecification
+from pyace import mpi as _mpi
 
 
 class BackendConfig:
@@ -37,7 +38,7 @@ class BackendConfig:
         return self.backend_config_dict.get(item, default_value)
 
 
-def attach_stress_weights(df, w_stress):
+def attach_stress_weights(df, w_stress, test=False):
     """Per-structure stress-loss weights in column `w_stress` (w_stress > 0; w_stress = 0: nothing, stress not fitted).
 
     A structure counts only if it is fully periodic and has a finite 6- or 9-component `stress` label (ASE convention,
@@ -55,11 +56,23 @@ def attach_stress_weights(df, w_stress):
             df.drop(columns="w_stress", inplace=True)
         return
     if "stress" not in df.columns:
+        if test:   # test set without stress labels: no stress metrics, the fit itself is unaffected
+            log.warning("Test set has no `stress` column: no stress test metrics")
+            df.drop(columns="w_stress", inplace=True, errors="ignore")
+            return
         raise ValueError("fit: loss: w_stress > 0 needs a `stress` column (ASE Voigt, eV/A^3) in the dataset")
     ok = df["stress"].map(lambda s: s is not None and np.size(s) in (6, 9) and bool(np.all(np.isfinite(s))))
     if "ase_atoms" in df.columns:
         ok &= df["ase_atoms"].map(lambda a: bool(np.all(a.get_pbc())))
     n = int(ok.sum())
+    if n:
+        smax = float(np.median([np.max(np.abs(np.asarray(v, dtype=float))) for v in df.loc[ok, "stress"]]))
+        if smax > 1.0:   # 1 eV/A^3 = 160 GPa as the median of max|sigma| almost certainly means GPa or kBar labels
+            log.warning("Stress labels: median max|sigma| = {:.3g}; pacemaker expects eV/A^3 (ASE convention, "
+                        "1 eV/A^3 = 160.2 GPa). Are these in GPa or kBar?".format(smax))
+    if "w_stress" in df.columns and test and pd.to_numeric(df["w_stress"], errors="coerce").isna().any():
+        # e.g. the train file has a w_stress column and the test file does not: uniform for the missing rows
+        df["w_stress"] = pd.to_numeric(df["w_stress"], errors="coerce").fillna(1.0)
     if "w_stress" in df.columns:
         w = pd.to_numeric(df["w_stress"], errors="coerce").astype(np.float64)
         if w.isna().any() or (w < 0).any():
@@ -69,6 +82,11 @@ def attach_stress_weights(df, w_stress):
         w = w.where(ok, 0.)
         tot = float(w.sum())
         if tot <= 0:
+            if test:
+                log.warning("Test set: no structure with a usable stress label and nonzero w_stress: no stress test "
+                            "metrics")
+                df["w_stress"] = 0.
+                return
             raise ValueError("column w_stress is zero on every structure with a usable stress label")
         df["w_stress"] = w / tot
         log.info("Stress fit: w_stress = {}, per-structure weights from the w_stress column (see 'Stress weights:' "
@@ -77,7 +95,14 @@ def attach_stress_weights(df, w_stress):
                  "without a usable label set to 0); normalised to sum 1".format(
                      w_stress, n, len(df), int((w > 0).sum()), dropped))
     else:
-        df["w_stress"] = ok.astype(np.float64) / max(n, 1)
+        if n == 0:
+            if test:
+                log.warning("Test set: no structure with a usable stress label: no stress test metrics")
+                df["w_stress"] = 0.
+                return
+            raise ValueError("fit: loss: w_stress > 0 but no structure has a usable stress label (periodic, finite "
+                             "6- or 9-component `stress`)")
+        df["w_stress"] = ok.astype(np.float64) / n
         log.info("Stress fit: w_stress = {}, uniform weights 1/N over the {} of {} structures with a usable stress "
                  "label".format(w_stress, n, len(df)))
 
@@ -163,6 +188,11 @@ class FitBackendAdapter:
         self.trainable_parameters_dict = trainable_parameters_dict
         self.bbasisconfig = bbasisconfig
 
+        if self.backend_config.evaluator_name == TENSORPOT_EVAL and _mpi.is_distributed():
+            raise ValueError("PACEMAKER_MPI (data-parallel fitting) is implemented for `backend: evaluator: torch` "
+                             "only; with the TF backend every rank would run the whole fit")
+        if self.backend_config.evaluator_name == PYACE_EVAL and float(getattr(loss_spec, "w_stress", 0) or 0) > 0:
+            log.warning("fit: loss: w_stress is ignored by `evaluator: pyace` (stress fitting needs torch or tensorpot)")
         if self.backend_config.evaluator_name in (TENSORPOT_EVAL, TORCH_EVAL):
             oom_errors = _tp_backend(self.backend_config.evaluator_name)[5]
             while True:
@@ -180,6 +210,9 @@ class FitBackendAdapter:
                         batch_size_reduction_factor = self.backend_config.get(BACKEND_BATCH_SIZE_REDUCTION_FACTOR_KW,
                                                                               1.618)  # default - golden ratio
                         new_batch_size = int(batch_size / batch_size_reduction_factor)
+                        if new_batch_size >= batch_size:   # factor <= 1 would retry the same batch size forever
+                            raise RuntimeError("Out of memory at batch size {} and batch_size_reduction_factor {} does "
+                                               "not reduce it".format(batch_size, batch_size_reduction_factor))
                         log.info("Decrease batch size (by factor {}): {} -> {}".format(batch_size_reduction_factor,
                                                                                        batch_size, new_batch_size))
                         if new_batch_size < 1:
@@ -317,7 +350,7 @@ class FitBackendAdapter:
             else:
                 jacobian_factor = jacobian_factor.astype(float)
             batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
-            attach_stress_weights(test_dataframe, float(getattr(loss_spec, "w_stress", 0) or 0))
+            attach_stress_weights(test_dataframe, float(getattr(loss_spec, "w_stress", 0) or 0), test=True)
             fit_options = fit_config.get(FIT_OPTIONS_KW, None)
             if fit_config.get("bfgs_checkpoint"):
                 # fit: bfgs_checkpoint: <file.npz> -> save/resume the BFGS state (native BFGS); absent = no file

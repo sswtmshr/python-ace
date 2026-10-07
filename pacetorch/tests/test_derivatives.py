@@ -101,6 +101,61 @@ def test_radial_and_embedding_types_match_cpp():
             assert de < 1e-9 and dF < 1e-6, "{} + {}: dE/at {:.1e} eV, dF {:.1e} eV/A".format(radbase, npot, de, dF)
 
 
+def _cpp_compare(bconf, atoms_list, cutoff):
+    """max |dE|/atom, |dF|, |dsigma| (eV/A^3) of the torch model against the C++ evaluator"""
+    from ase.calculators.singlepoint import SinglePointCalculator
+    from pyace import PyACECalculator
+    from pyace.atomicenvironment import generate_tp_atoms
+    import pandas as pd
+    from pacetorch.data import batching_data
+    from pacetorch.potential import TorchPotential
+    bconf.deltaSplineBins = 2e-5          # C++ spline interpolation error well below the tolerance
+    calc = PyACECalculator(bconf)
+    ref, rows = [], []
+    for at in atoms_list:
+        x = at.copy(); x.calc = calc
+        ref.append((x.get_potential_energy(), x.get_forces(), x.get_stress(), len(at)))
+        y = at.copy(); y.calc = SinglePointCalculator(y, energy=0., forces=np.zeros((len(y), 3)))
+        rows.append(generate_tp_atoms(y, cutoff=cutoff))
+    df = pd.DataFrame(dict(tp_atoms=rows, w_energy=[1.] * len(rows), w_forces=[np.ones(r[3]) for r in ref]))
+    tp = TorchPotential(A.ACE(bconf))
+    e, f, sig = [t.numpy() for t in tp.evaluate(tp.device_batch(batching_data(df, len(rows))[0]))]
+    fs = np.split(f, np.cumsum([r[3] for r in ref])[:-1])
+    voigt = lambda m: np.array([m[0, 0], m[1, 1], m[2, 2], m[1, 2], m[0, 2], m[0, 1]])
+    return (max(abs(e[i, 0] - r[0]) / r[3] for i, r in enumerate(ref)),
+            max(np.abs(fs[i] - r[1]).max() for i, r in enumerate(ref)),
+            max(np.abs(voigt(sig[i]) - r[2]).max() for i, r in enumerate(ref)))
+
+
+def test_inner_cutoff_and_core_repulsion_match_cpp():
+    """distance (core repulsion inside r_in, one cutoff on the summed core density), density and zbl, with pairs
+    inside r_in, against the C++ evaluator (TF and the first torch port did not match C++ here)."""
+    from ase.build import bulk
+    from pyace.multispecies_basisextension import create_multispecies_basis_config
+    cases = {"distance": ([10.0, 1.0], 2.3, 0.3, 5.0, 5.0), "density": ([500.0, 2.0], 0.0, 0.0, 100000, 250),
+             "zbl": ([1.0, 1.0], 2.0, 0.1, 1.0, 1.0)}
+    structs = []
+    for k, a in enumerate((4.4, 4.8, 5.43)):
+        at = bulk("Si", "diamond", a=a, cubic=True)
+        at.rattle(0.03, seed=k)
+        structs.append(at)
+    for ict, (core, rin, din, rc, drc) in cases.items():
+        b = create_multispecies_basis_config({
+            "elements": ["Si"],
+            "embeddings": {"ALL": {"npot": "FinnisSinclairShiftedScaled", "fs_parameters": [1, 1, 1, 0.5],
+                                   "ndensity": 2, "rho_core_cut": rc, "drho_core_cut": drc}},
+            "bonds": {"ALL": {"radbase": "SBessel", "radparameters": [5.25], "rcut": 5.0, "dcut": 0.01,
+                              "NameOfCutoffFunction": "cos", "nradbase": 6, "core-repulsion": core, "r_in": rin,
+                              "delta_in": din, "inner_cutoff_type": ict}},
+            "functions": {"ALL": {"nradmax_by_orders": [6, 3, 2], "lmax_by_orders": [0, 2, 1]}}})
+        ace = A.ACE(b)
+        c0 = ace.get_coefs()
+        ace.set_coefs(c0 + np.random.default_rng(5).normal(scale=0.2, size=c0.shape))
+        de, dF, dS = _cpp_compare(ace.get_updated_config(), structs, 5.0)
+        assert de < 1e-9 and dF < 1e-6 and dS < 1e-7, "{}: dE/at {:.1e}, dF {:.1e}, dsigma {:.1e}".format(
+            ict, de, dF, dS)
+
+
 def _model_and_batch():
     from ase.build import bulk
     from pyace.atomicenvironment import generate_tp_atoms
@@ -188,6 +243,7 @@ if __name__ == "__main__":
     test_products_match_direct_formula()
     test_abasis_paths_agree()
     test_radial_and_embedding_types_match_cpp()
+    test_inner_cutoff_and_core_repulsion_match_cpp()
     if torch.cuda.is_available():
         test_triton_kernels_match_torch()
     print("ok")

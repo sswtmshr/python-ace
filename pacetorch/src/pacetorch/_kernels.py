@@ -34,28 +34,28 @@ if _HAVE_TRITON:
         end = tl.load(PTR + a + 1)
         rn = tl.arange(0, BN)
         rm = tl.arange(0, BM)
-        rp = tl.arange(0, BP)
+        rp = tl.arange(0, BP).to(tl.int64)
         acc = tl.zeros((BN, BM), dtype=tl.float64)
         for k in range(K):
             for p0 in range(start, end, BP):
-                pp = p0 + rp
+                pp = p0.to(tl.int64) + rp
                 mp = pp < end
-                u = tl.load(U + k * P * n + pp[:, None] * n + rn[None, :],
+                u = tl.load(U + k.to(tl.int64) * P * n + pp[:, None] * n + rn[None, :],
                             mask=mp[:, None] & (rn[None, :] < n), other=0.)
-                v = tl.load(V + k * P * m + pp[:, None] * m + rm[None, :],
+                v = tl.load(V + k.to(tl.int64) * P * m + pp[:, None] * m + rm[None, :],
                             mask=mp[:, None] & (rm[None, :] < m), other=0.)
                 acc += tl.sum(u[:, :, None] * v[:, None, :], axis=0)
-        tl.store(OUT + a * n * m + rn[:, None] * m + rm[None, :], acc, mask=(rn[:, None] < n) & (rm[None, :] < m))
+        tl.store(OUT + a.to(tl.int64) * n * m + rn[:, None] * m + rm[None, :], acc, mask=(rn[:, None] < n) & (rm[None, :] < m))
 
     @triton.jit
     def _gather_contract_kernel(G, IDX, W, OUT, P, n, m, DIM: tl.constexpr, BN: tl.constexpr, BM: tl.constexpr,
                                 BP: tl.constexpr):
         pid = tl.program_id(0)
-        pp = pid * BP + tl.arange(0, BP)
+        pp = pid.to(tl.int64) * BP + tl.arange(0, BP).to(tl.int64)
         mp = pp < P
         rn = tl.arange(0, BN)
         rm = tl.arange(0, BM)
-        c = tl.load(IDX + pp, mask=mp, other=0)
+        c = tl.load(IDX + pp, mask=mp, other=0).to(tl.int64)
         g = tl.load(G + c[:, None, None] * n * m + rn[None, :, None] * m + rm[None, None, :],
                     mask=mp[:, None, None] & (rn[None, :, None] < n) & (rm[None, None, :] < m), other=0.)
         if DIM == 2:
@@ -77,7 +77,8 @@ def seg_outer(us, vs, ptr, nat):
     if nat:
         BN, BM = _p2(n), _p2(m)
         BP = max(1, min(16, 4096 // (BN * BM)))
-        _seg_outer_kernel[(nat,)](U, V, ptr, out, K, P, n, m, BN=BN, BM=BM, BP=BP)
+        with torch.cuda.device(U.device):   # Triton launches on the current device/stream, not the tensors' device
+            _seg_outer_kernel[(nat,)](U, V, ptr, out, K, P, n, m, BN=BN, BM=BM, BP=BP)
     return out
 
 
@@ -90,5 +91,6 @@ def gather_contract(G, idx, w, dim):
     if P:
         BN, BM = _p2(n), _p2(m)
         BP = max(1, min(64, 4096 // (BN * BM)))
-        _gather_contract_kernel[(triton.cdiv(P, BP),)](G, idx, w, out, P, n, m, DIM=dim, BN=BN, BM=BM, BP=BP)
+        with torch.cuda.device(G.device):
+            _gather_contract_kernel[(triton.cdiv(P, BP),)](G, idx, w, out, P, n, m, DIM=dim, BN=BN, BM=BM, BP=BP)
     return out

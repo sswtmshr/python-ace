@@ -46,6 +46,8 @@ Without a `backend:` section pacemaker uses `pyace`, upstream's C++ evaluator on
 
 - `TensorPotential/`: upstream's TensorFlow model plus the multi-GPU / multi-node fitting and the stress term
   described here; NVIDIA GPUs.
+- pacemaker runs `tensorpot` on one process only: under `PACEMAKER_MPI=1` it stops with an error (multi-GPU fitting
+  goes through the PyTorch backend). The TensorFlow multi-GPU options below remain in `TensorPotential/`.
 
 #### TensorFlow-only options for multi-GPU
 
@@ -74,20 +76,19 @@ fit:
 - The dataset needs a `stress` column: 3x3 or 6 Voigt components per structure, eV/A^3, ASE sign convention.
 - **Weights.** A dataset `w_stress` column wins. Otherwise they follow the weighting policy: uniform -> uniform,
   EnergyBasedWeightingPolicy -> the energy weights, ExternalWeightingPolicy -> its `w_stress` column. They are
-  normalised over the fully periodic structures with a finite stress label.
+  normalised over the fully periodic structures with a finite stress label; `w_factor`/`aug_factor` apply. A test
+  set without stress labels has no stress metrics.
 - Both GPU backends fit stress. Stress errors are printed and written with the energy and force metrics.
 - An unknown key in `fit: loss:` is accepted with a warning.
 
 ## Multi-GPU / multi-node fitting
 
 ```bash
-PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 pacemaker input.yaml                  # PyTorch
-PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 bash -c 'CUDA_VISIBLE_DEVICES=$SLURM_LOCALID pacemaker input.yaml'   # TF
+PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 pacemaker input.yaml
 ```
 
-- One MPI rank per GPU. PyTorch: each rank takes GPU (node-local rank) modulo (visible GPUs), from MPI with any
-  launcher, and warns if two ranks share a GPU. TensorFlow (its own MPI code in `TensorPotential/`): the launch
-  line gives each rank its GPU.
+- PyTorch backend only (pacemaker refuses `tensorpot` under MPI). One MPI rank per GPU: each rank takes GPU
+  (node-local rank) modulo (visible GPUs), from MPI with any launcher, and warns if two ranks share a GPU.
 - Every rank runs the same optimizer. Each evaluates a contiguous share of the batches; loss and gradient are summed
   over the ranks, so every rank takes the same step. Only rank 0 writes files; an error on any rank
   ends the whole job instead of leaving the others waiting.
@@ -136,6 +137,24 @@ training differed; the TensorFlow backend keeps upstream's:
 | ChebExpCos radial basis | no cos taper near rcut (forces off ~1e-2 eV/A) | C++ formula |
 | FinnisSinclair embedding (exponent != 1) | different small-rho smoothing (up to 3e-2 eV/atom) | C++ formula |
 | rank-1 functions | assumed ordered n = 1..nradbase (crash for partial sets) | mapped by n |
+| core repulsion / inner cutoff (distance, density, zbl) | not as in C++ (up to 7 eV/atom inside r_in) | C++ formulas |
+
+## Upstream bugs fixed
+
+| upstream behaviour | effect | here |
+|---|---|---|
+| bare `except: pass` around weight application | silently unweighted fit | errors surface |
+| numeric `data: reference_energy` replaced by 0 | wrong reference | fixed |
+| `test_size: 0` | crash | no test set |
+| EnergyBasedWeightingPolicy reseeds numpy from entropy | irreproducible; MPI ranks disagree | top-level seed |
+| external weights merged on a renumbered index | weights on wrong rows with test_size | the file's index |
+| predictions after a multi-cycle fit used the last cycle | outputs describe another potential | saved potential |
+| scipy BFGS O(N^3) update | seconds per iteration at N ~ 10^4 | O(N^2), on the GPU |
+| early stopping at the final test evaluation | crash at the end of the fit | handled |
+| dataset batched twice per fit; interim YAML every iteration | ~7 s per step; ~0.3 s per iteration | once; throttled |
+| `low_max_abs_f_comp` set only inside a bare try | AttributeError | default |
+| deprecated ASE `set_calculator` | FutureWarning floods logs | `atoms.calc` |
+| unknown `fit: loss:` keys silently ignored | typos do nothing | accepted with a warning |
 
 ## Credits and licence
 
