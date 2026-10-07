@@ -190,7 +190,10 @@ class FitBackendAdapter:
                         # check the latest version of potential, update bbasisconfig to restart
                         try:
                             log.info("Attempt to get last version of potential")
-                            bbasisconfig = self.fitter.tensorpot.potential.get_updated_config()
+                            # restart from the last ACCEPTED iterate: the potential's current coefficients can be
+                            # a rejected line-search trial point (seen: loss 747 instead of 45.5 after the restart)
+                            last_x = getattr(self.fitter, "_last_x", None)
+                            bbasisconfig = self.fitter.tensorpot.potential.get_updated_config(updating_coefs=last_x)
                             log.info("Last version of potential is extracted")
                         except Exception as e:
                             log.error("Can not get last version of potential: {}".format(e))

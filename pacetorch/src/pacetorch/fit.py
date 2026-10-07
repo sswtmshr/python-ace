@@ -26,6 +26,13 @@ from pacetorch.constants import *
 from pacetorch.data import batching_data
 from pacetorch.fitmetrics import FitMetrics
 
+import os
+
+_OOM = getattr(torch, "OutOfMemoryError", None) or torch.cuda.OutOfMemoryError
+# test hook "rank:n": that MPI rank raises out-of-memory in its n-th collective GPU step (0 = first batch upload), once
+_INJECT_OOM = [int(v) for v in os.environ.get("PACETORCH_INJECT_OOM", "-1:-1").split(":")]
+_collective_calls = [0]
+
 try:   # framework-agnostic data-parallel layer (PACEMAKER_MPI=1); identity when disabled
     from pyace import mpi
 except ImportError:  # pragma: no cover
@@ -86,6 +93,27 @@ class FitTorchPotential:
         part = np.array_split(np.arange(len(batches)), mpi.world_size())[mpi.rank()]
         return [batches[i] for i in part]
 
+    def _collective(self, fn, *args):
+        """Run this rank's share of GPU work. With MPI, out-of-GPU-memory is decided collectively: if fn runs out of
+        memory on any rank, every rank raises it, so fitadapter's batch-size reduction restarts all ranks together
+        (one rank alone restarting with a smaller batch desynchronised the collectives)."""
+        if not self._dist():
+            return fn(*args)
+        err, out = None, None
+        try:
+            _collective_calls[0] += 1
+            if _INJECT_OOM == [mpi.rank(), _collective_calls[0] - 1]:
+                raise _OOM("injected out-of-memory on MPI rank {} (PACETORCH_INJECT_OOM)".format(mpi.rank()))
+            out = fn(*args)
+        except _OOM as e:
+            err = e
+        if mpi.allreduce_max(int(err is not None)):
+            out = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise err if err is not None else _OOM("CUDA out of memory on another MPI rank")
+        return out
+
     def _root_call(self, fn, *args, **kwargs):
         """run a callback on rank 0 only; a StopIteration it raises (early stopping) stops every rank"""
         if not self._dist():
@@ -123,13 +151,13 @@ class FitTorchPotential:
         np_batches = batching_data(self.data_df, batch_size=batch_size)
         self.n_batches = len(np_batches)
         self.metrics = self._make_metrics(np_batches)
-        batches = self.prepare_batches(self._local(np_batches))
+        batches = self._collective(self.prepare_batches, self._local(np_batches))
         del np_batches
         if test_df is not None:
             self.test_df = test_df[test_df["tp_atoms"].notna()].reset_index(drop=True)
             np_test = batching_data(self.test_df, batch_size=batch_size)
             self.test_metrics = self._make_metrics(np_test)
-            self._test_batches = self.prepare_batches(self._local(np_test))
+            self._test_batches = self._collective(self.prepare_batches, self._local(np_test))
         log.info("Batches on {}: {} of {} train{}{} ({:.1f} s)".format(
             self.tensorpot.device, len(batches), self.n_batches,
             " / {} test".format(len(self._test_batches)) if test_df is not None else "",
@@ -203,18 +231,7 @@ class FitTorchPotential:
     # ------------------------------------------------------------------------------------------- loss / grad
     def _run(self, x, batches):
         """One full pass: loss, gradient (host numpy), and per-structure errors."""
-        tp = self.tensorpot
-        tp.potential.set_coefs(x)
-        tot_loss, tot_grad = None, None
-        outs = []
-        for db in batches:
-            loss, g, e, f, s = tp.loss_and_grad(db)
-            tot_loss = loss if tot_loss is None else tot_loss + loss
-            tot_grad = g if tot_grad is None else tot_grad + g
-            outs.append((e, f, s))
-        # single device -> host transfer
-        tot_loss = float(tot_loss.cpu()) if tot_loss is not None else 0.
-        tot_grad = tot_grad.cpu().numpy() if tot_grad is not None else np.zeros(self.ncoefs)
+        tot_loss, tot_grad, outs = self._collective(self._local_pass, x, batches)
         if self._dist():
             tot_loss = mpi.allreduce_scalar_sum(tot_loss)
             tot_grad = mpi.allreduce_array_sum(tot_grad)
@@ -241,6 +258,22 @@ class FitTorchPotential:
             if serrs is not None:
                 serrs = [mpi.allgather_vstack(a) for a in serrs]
         return tot_loss, tot_grad, tuple(errs), (tuple(serrs) if serrs is not None else None)
+
+    def _local_pass(self, x, batches):
+        """this rank's batches: summed loss and gradient (host), per-batch predictions"""
+        tp = self.tensorpot
+        tp.potential.set_coefs(x)
+        tot_loss, tot_grad = None, None
+        outs = []
+        for db in batches:
+            loss, g, e, f, s = tp.loss_and_grad(db)
+            tot_loss = loss if tot_loss is None else tot_loss + loss
+            tot_grad = g if tot_grad is None else tot_grad + g
+            outs.append((e, f, s))
+        # single device -> host transfer
+        tot_loss = float(tot_loss.cpu()) if tot_loss is not None else 0.
+        tot_grad = tot_grad.cpu().numpy() if tot_grad is not None else np.zeros(self.ncoefs)
+        return tot_loss, tot_grad, outs
 
     def fit_func(self, x, batches):
         t0 = time.time()

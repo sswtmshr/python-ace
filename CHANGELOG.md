@@ -119,3 +119,9 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | ChebExpCos radial basis | no cos taper near rcut: forces off ~1e-2 eV/A | C++ formula |
 | FinnisSinclair embedding (exponent != 1) | different small-rho smoothing: up to 3e-2 eV/at | C++ formula |
 | rank-1 functions | assumed ordered n = 1..nradbase: crash for partial sets | mapped by n |
+
+### 14. Out of memory under MPI (2026-10-07)
+
+- Bug: only the rank that ran out of memory reduced its batch size, so the ranks desynchronised.
+- Change: out-of-memory is decided collectively. The restart is from the last *accepted* BFGS step; upstream used the
+  last evaluated point, which could be a rejected line-search trial.

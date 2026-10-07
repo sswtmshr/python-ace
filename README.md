@@ -88,6 +88,8 @@ PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 bash -c 'CUDA_VISIBLE_DEVICES=$SLURM
 - Every rank runs the same optimizer. Each evaluates a contiguous share of the batches; loss and gradient are summed
   over the ranks, so every rank takes the same step. Only rank 0 writes files; an error on any rank
   ends the whole job instead of leaving the others waiting.
+- Out of GPU memory on any rank (PyTorch): all ranks reduce the batch size together and restart from the
+  last accepted BFGS step.
 - Optimizers: BFGS, L-BFGS-B, CG.
 - `PACEMAKER_MPI_REPRODUCIBLE=1`: sums in a fixed rank order instead of the MPI library's (results still depend on
   the number of ranks).

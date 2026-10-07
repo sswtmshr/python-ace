@@ -594,6 +594,11 @@ def apply_weights(df: Optional[pd.DataFrame], weighting_policy_spec, ignore_weig
     if WEIGHTS_ENERGY_COLUMN in df.columns and WEIGHTS_FORCES_COLUMN in df.columns and not ignore_weights:
         log.info("Both weighting columns ({} and {}) are found, no another weighting policy will be applied".format(
             WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN))
+        if WEIGHTS_STRESS_COLUMN in df.columns and not df[WEIGHTS_STRESS_COLUMN].isna().all():
+            log.info("Stress weights: the dataset's `{}` column".format(WEIGHTS_STRESS_COLUMN))
+        else:
+            log.info("Stress weights: uniform (the dataset has energy/force weight columns but no `{}` column)".format(
+                WEIGHTS_STRESS_COLUMN))
     else:
         if ignore_weights and (WEIGHTS_ENERGY_COLUMN in df.columns or WEIGHTS_FORCES_COLUMN in df.columns):
             log.info("Existing weights are ignored, weighting policy calculation is forced")
