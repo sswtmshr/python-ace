@@ -121,8 +121,8 @@ class SphericalHarmonics:
                                                                 + self.blm[self.lm1d(l, m)] * plm[self.lm1d(l - 2, m)]))
         return plm
 
-    def compute(self, rhat):
-        """rhat [P,3] -> (yr, yi) [P, (lmax+1)^2]"""
+    def _parts(self, rhat):
+        """{(l, m >= 0): Re Y_lm}, {(l, m >= 0): Im Y_lm} without the sqrt(4 pi) factor"""
         x, y, z = rhat[:, 0], rhat[:, 1], rhat[:, 2]
         plm = self.legendre(z)
         yr, yi = {}, {}
@@ -136,16 +136,38 @@ class SphericalHarmonics:
             for l in range(m, self.lmax + 1):
                 yr[(l, m)] = pr * plm[self.lm1d(l, m)]
                 yi[(l, m)] = pi * plm[self.lm1d(l, m)]
+        return yr, yi
+
+    def _row(self, yr, yi, l):
+        """Re and Im of Y_l,-l..l (m < 0 from Y_l,-m* (-1)^m)"""
+        out_r, out_i = [], []
+        for m in range(-l, l + 1):
+            if m < 0:
+                ph = 1. if abs(m) % 2 == 0 else -1.
+                out_r.append(yr[(l, -m)] * ph)
+                out_i.append(-yi[(l, -m)] * ph)
+            else:
+                out_r.append(yr[(l, m)])
+                out_i.append(yi[(l, m)])
+        return out_r, out_i
+
+    def compute_blocks(self, rhat):
+        """rhat [P,3] -> per l: [P, 2(2l+1)] = (Re Y_l,-l..l, Im Y_l,-l..l) * sqrt(4 pi)"""
+        yr, yi = self._parts(rhat)
+        out = []
+        for l in range(self.lmax + 1):
+            r, i = self._row(yr, yi, l)
+            out.append(torch.stack(r + i, 1) * self.factor4pi)
+        return out
+
+    def compute(self, rhat):
+        """rhat [P,3] -> (yr, yi) [P, (lmax+1)^2]"""
+        yr, yi = self._parts(rhat)
         out_r, out_i = [], []
         for l in range(self.lmax + 1):
-            for m in range(-l, l + 1):
-                if m < 0:
-                    ph = 1. if abs(m) % 2 == 0 else -1.
-                    out_r.append(yr[(l, -m)] * ph)
-                    out_i.append(-yi[(l, -m)] * ph)
-                else:
-                    out_r.append(yr[(l, m)])
-                    out_i.append(yi[(l, m)])
+            r, i = self._row(yr, yi, l)
+            out_r += r
+            out_i += i
         return torch.stack(out_r, 1) * self.factor4pi, torch.stack(out_i, 1) * self.factor4pi
 
 

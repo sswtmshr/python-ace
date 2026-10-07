@@ -16,6 +16,7 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | 4 forward-over-reverse (trial) | 2026-10-06 | 21.45 | 30.87 GiB | |
 | 6 back to reverse-over-reverse, int32 indices | 2026-10-06 | | 30.75 GiB** | |
 | 10 prefix-tree products | 2026-10-07 | 10.33 | 27.17 GiB | |
+| 11 hand-written A-basis derivatives | 2026-10-07 | | 11.68 GiB | |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 - \*\* measured after 7 and 8, which do not change memory (32.39 -> 30.75 GiB: the int32 index arrays).
@@ -93,3 +94,11 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - Products sharing their first factors compute each shared prefix once; all last factors are one matrix product.
 - One A100, one job (59475340): 11.75 s / 30.75 GiB -> 10.33 s / 27.17 GiB (-12% each). Exact vs TensorFlow (1e-13)
   and the C++ evaluator.
+
+### 11. A-basis with hand-written derivatives (2026-10-07)
+
+- The A-basis is a segmented sum of outer products, and its derivatives are of the same form (closed under
+  differentiation), so they are written out instead of taped by automatic differentiation, which keeps a
+  [pairs x channels] array.
+- One A100 (job 59476318): 12.01 s / 27.18 GiB -> 11.03 s / 11.68 GiB. Equal to automatic differentiation to 1e-15
+  (gradcheck and gradgradcheck). The experiments of 9 are removed.

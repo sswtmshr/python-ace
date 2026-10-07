@@ -39,8 +39,7 @@ class DeviceBatch:
             nat=ix["nat"], atoms_e_cpu=ix["atoms_e"], atoms_e=[t(a, L) for a in ix["atoms_e"]],
             present=t(ix["present"].astype(np.float64)),
             pairs=[dict(n=len(P["p"]), p=t(P["p"], L), central=t(P["central"], L),
-                        central_local=t(P["central_local"], L), kmax=P["kmax"],
-                        dense=t(P["dense"], torch.long)) for P in ix["pairs"]])
+                        central_local=t(P["central_local"], L)) for P in ix["pairs"]])
 
 
 class TorchPotential:

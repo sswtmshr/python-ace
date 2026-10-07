@@ -8,8 +8,10 @@ Differences from the TF implementation are in how the same numbers are computed,
   * all index bookkeeping (bond-type partition, atom->element, unique central atoms) is done once per batch on the
     host (prepare_batch), instead of dynamic_partition / tf.unique / tf.where inside every evaluation;
   * the atomic base A is built only for the (mu_j, n, l, m) channels the product basis actually uses, with no padding
-    to nradmax/lmax, and pairs are scatter-added straight into it;
-  * the last factor of every product basis function only needs the real part.
+    to nradmax/lmax, and pairs are scatter-added straight into it (or, PACETORCH_ABASIS=outer, as segmented outer
+    products with hand-written derivatives: less memory);
+  * the product basis shares common partial products (a prefix tree) and does the last factor of all ms-combinations
+    of all functions as one matrix multiply, of which only the real part is needed (ACE.products).
 """
 from itertools import combinations_with_replacement
 
@@ -20,11 +22,13 @@ import os
 
 from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding, radial_function
 
-# A-basis construction: "dense" (batched matmul over padded neighbours) or "scatter" (per-pair products + index_add)
-_DENSE_A = os.environ.get("PACETORCH_ABASIS", "scatter") == "dense"
-# product basis: "complex" (complex128 tensors) or "real" (separate real/imaginary parts)
-_PRODUCTS = os.environ.get("PACETORCH_PRODUCTS", "real")       # real | complex | gemm
-_COMPLEX_PROD = _PRODUCTS == "complex"
+# A-basis construction (identical results, a memory/speed trade-off):
+#   "scatter" (default) per-pair products + index_add, plain autograd
+#   "outer"   segmented outer products with hand-written derivatives (_SegOuter): ~2.5x less GPU memory, slower so far
+#             (becomes the default only once it is at least as fast)
+_ABASIS = os.environ.get("PACETORCH_ABASIS", "scatter")
+if _ABASIS not in ("outer", "scatter"):
+    raise ValueError("PACETORCH_ABASIS={}: use outer or scatter".format(_ABASIS))
 
 _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12,
       'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23,
@@ -37,8 +41,83 @@ _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9,
       'Th': 90, 'Pa': 91, 'U': 92, 'Np': 93, 'Pu': 94}
 
 
+class _SegOuter(torch.autograd.Function):
+    """A[a, n, m] = sum over pairs p of atom a (idx[p] = a) of sum_k u_k[p, n] v_k[p, m];  apply(idx, nat, u1, v1, ...).
+
+    The A-basis is sum_j R_nl(r_j) Y_lm(r_j); per l that is this segmented outer product with u = R_l, v = (Re, Im)
+    Y_l. Autograd through the plain version saves and re-reads several [pairs, channels] arrays per derivative order;
+    here the derivatives are written out: the gradient is a gather-and-contract (_GatherContract), whose gradient is
+    again a segmented outer product or a gather-and-contract, so any derivative order (the force loss needs two)
+    only ever keeps the per-pair factors and per-atom arrays."""
+
+    @staticmethod
+    def forward(ctx, idx, nat, *uv):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(idx, *uv)
+        ctx.nat = nat
+        us, vs = uv[0::2], uv[1::2]
+        P, n, m = us[0].shape[0], us[0].shape[1], vs[0].shape[1]
+        acc = us[0].unsqueeze(2) * vs[0].unsqueeze(1)
+        for u, v in zip(us[1:], vs[1:]):
+            acc.addcmul_(u.unsqueeze(2), v.unsqueeze(1))
+        return acc.new_zeros(nat, n * m).index_add_(0, idx, acc.view(P, n * m)).view(nat, n, m)
+
+    @staticmethod
+    def backward(ctx, G):
+        idx, *uv = ctx.saved_tensors
+        grads = [None] * len(uv)
+        if G is None:
+            return (None, None, *grads)
+        ws, dims, need = [], [], []
+        for k in range(len(uv)):
+            if ctx.needs_input_grad[2 + k]:
+                if k % 2 == 0:   # d/du_k = sum_m G[., n, m] v_k[p, m]
+                    ws.append(uv[k + 1]); dims.append(2)
+                else:            # d/dv_k = sum_n G[., n, m] u_k[p, n]
+                    ws.append(uv[k - 1]); dims.append(1)
+                need.append(k)
+        if ws:
+            for k, o in zip(need, _GatherContract.apply(G, idx, tuple(dims), *ws)):
+                grads[k] = o
+        return (None, None, *grads)
+
+
+class _GatherContract(torch.autograd.Function):
+    """out_k[p] = contraction of G[idx[p]] with w_k[p]: over m (dims[k] = 2, -> [P, n]) or over n (dims[k] = 1,
+    -> [P, m]); apply(G, idx, dims, w1, w2, ...). One gather of G serves all outputs."""
+
+    @staticmethod
+    def forward(ctx, G, idx, dims, *ws):
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(G, idx, *ws)
+        ctx.dims = dims
+        Gp = G.index_select(0, idx)
+        return tuple((Gp * w.unsqueeze(1)).sum(2) if d == 2 else (Gp * w.unsqueeze(2)).sum(1)
+                     for w, d in zip(ws, dims))
+
+    @staticmethod
+    def backward(ctx, *hs):
+        G, idx, *ws = ctx.saved_tensors
+        gG, gws = None, [None] * len(ws)
+        if ctx.needs_input_grad[0]:
+            uv = []
+            for w, d, h in zip(ws, ctx.dims, hs):
+                if h is not None:   # dims 2: dG[n, m] += h[n] w[m];  dims 1: dG[n, m] += w[n] h[m]
+                    uv += [h, w] if d == 2 else [w, h]
+            if uv:
+                gG = _SegOuter.apply(idx, G.shape[0], *uv)
+        nw, nd, need = [], [], []
+        for k, (d, h) in enumerate(zip(ctx.dims, hs)):
+            if h is not None and ctx.needs_input_grad[3 + k]:
+                nw.append(h); nd.append(1 if d == 2 else 2); need.append(k)
+        if nw:
+            for k, o in zip(need, _GatherContract.apply(G, idx, tuple(nd), *nw)):
+                gws[k] = o
+        return (gG, None, None, *gws)
+
+
 def _prefix_tree(ranks, ncols):
-    """Product basis as shared prefixes + one GEMM (PACETORCH_PRODUCTS=gemm).
+    """Product basis as shared prefixes + one GEMM.
 
     Every ms-combination is a product of r A-columns; products commute, so sort the columns, take the first r-1 as
     the prefix and the last one as the free factor. The prefixes form a tree: level 1 = the A columns themselves,
@@ -189,7 +268,12 @@ class ACE:
             nl_idx = [n * (bs.lmax + 1) + l for (n, l, lm) in ch]
             lm_idx = [lm for (n, l, lm) in ch]
             lmax_used = max([l for (n, l, lm) in ch], default=0)
-            nlm_idx = [n * (lmax_used + 1) ** 2 + lm for (n, l, lm) in ch]   # into the dense [n, (L+1)^2] A block
+            # "outer" layout: per l a block [n_l, (Re m=-l..l, Im m=-l..l)], n_l = 1 + largest n used with this l
+            n_l = [1 + max([n for (n, l_, lm) in ch if l_ == l], default=-1) for l in range(lmax_used + 1)]
+            off = np.cumsum([0] + [n_l[l] * 2 * (2 * l + 1) for l in range(lmax_used + 1)])
+            pos = lambda n, l, lm: off[l] + n * 2 * (2 * l + 1) + (lm - l * l)
+            o_r = [pos(n, l, lm) for (n, l, lm) in ch]
+            o_i = [pos(n, l, lm) + 2 * l + 1 for (n, l, lm) in ch]
             self.bonds.append(dict(
                 c=c, nradmax=bs.nradmax, lmax=bs.lmax, nradbase=bs.nradbasemax, rcut=float(bs.rcut),
                 radbase=bs.radbasename, lmbda=float(bs.radparameters[0]),
@@ -199,7 +283,8 @@ class ACE:
                 r1_idx=torch.tensor(coefs_r1[c], dtype=torch.long),
                 nl_idx=torch.tensor(nl_idx, dtype=torch.long), lm_idx=torch.tensor(lm_idx, dtype=torch.long),
                 sh=SphericalHarmonics(lmax_used) if ch else None, has_A=bool(ch),
-                L=lmax_used, nlm_idx=torch.tensor(nlm_idx, dtype=torch.long)))
+                L=lmax_used,
+                n_l=n_l, o_r=torch.tensor(o_r, dtype=torch.long), o_i=torch.tensor(o_i, dtype=torch.long)))
 
         self.coefs = torch.tensor(coefs, dtype=torch.float64)
         self.to(device)
@@ -219,7 +304,7 @@ class ACE:
                 R["idx"] = [mv(i) for i in R["idx"]]
                 R["gcg"], R["msum"] = mv(R["gcg"]), mv(R["msum"])
         for B in self.bonds:
-            for k in ("r1_idx", "nl_idx", "lm_idx", "nlm_idx"):
+            for k in ("r1_idx", "nl_idx", "lm_idx", "o_r", "o_i"):
                 B[k] = mv(B[k])
         self.coefs = self.coefs.to(self.device)
         return self
@@ -276,14 +361,7 @@ class ACE:
             k = e * self.nelements + mu
             p = order[bounds[k]:bounds[k + 1]]
             cl = local[ind_i[p]]
-            # dense layout: pair -> (central atom, slot); slot = rank of the pair among its atom's pairs of this type
-            o = np.argsort(cl, kind="stable")
-            cnt = np.bincount(cl, minlength=len(atoms_e[e]))
-            start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
-            slot = np.empty(len(p), dtype=np.int64)
-            slot[o] = np.arange(len(p)) - start[cl[o]]
-            kmax = int(cnt.max()) if len(p) else 0
-            pairs.append(dict(p=p, central=ind_i[p], central_local=cl, kmax=kmax, dense=cl * kmax + slot))
+            pairs.append(dict(p=p, central=ind_i[p], central_local=cl))
             present[ind_i[p], ci] = True
         return dict(nat=nat, atoms_e=atoms_e, pairs=pairs, present=present)
 
@@ -309,6 +387,25 @@ class ACE:
             self.aux = [dsor.reshape(1, 1)]
         else:
             self.aux = None
+
+    @staticmethod
+    def products(E, Ar, Ai, bcoefs):
+        """Rank >= 2 densities rho[a, d] of one element from its compact A (real, imaginary parts), via the shared
+        prefix tree (_prefix_tree): rho_d = Re sum_j A_j sum_p P_p T[p, j, d]."""
+        ne_, nd, nc = Ar.shape[0], E["nd"], E["ncols"]
+        Tr = E["tree"]
+        C = bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, nd)
+        T = torch.zeros(Tr["nrows"] * nc, nd, dtype=Ar.dtype, device=Ar.device).index_add(
+            0, Tr["flat"], C.index_select(0, Tr["func"]) * Tr["gcg"].unsqueeze(1)).view(Tr["nrows"], nc * nd)
+        pr, pi = [Ar], [Ai]
+        for parent, col in Tr["levels"]:
+            a_r, a_i = pr[-1].index_select(1, parent), pi[-1].index_select(1, parent)
+            b_r, b_i = Ar.index_select(1, col), Ai.index_select(1, col)
+            pr.append(a_r * b_r - a_i * b_i)
+            pi.append(a_i * b_r + a_r * b_i)
+        Y = torch.cat([torch.cat(pr, 1), torch.cat(pi, 1)], 0) @ T          # [2 atoms, ncols*nd]
+        Yr, Yi = Y[:ne_].view(ne_, nc, nd), Y[ne_:].view(ne_, nc, nd)
+        return (Ar.unsqueeze(2) * Yr - Ai.unsqueeze(2) * Yi).sum(1)
 
     def atomic_energy(self, r_ij, idx):
         """r_ij [P,3] -> per-atom energy [nat] (float64); idx = device-side prepare_batch() output."""
@@ -348,26 +445,19 @@ class ACE:
                     r1 = torch.nn.functional.pad(r1, (0, nd_max - B["nd"]))
                 rho1[e] = rho1[e] + r1
             # A_{mu n l m}: R_nl(r) Y_lm(rhat), only the used channels
-            if B["has_A"] and _DENSE_A:
-                # A_{n,lm} = sum_j R_nl(r_j) Y_lm(rhat_j) as one batched matmul per l over a padded
-                # [atom, slot] neighbour layout: no per-pair [P, channels] products, no scatter
+            if B["has_A"] and _ABASIS == "outer":
                 crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
-                L, nr = B["L"], B["nradmax"]
-                Rp = torch.einsum("pk,nlk->pnl", g, crad[:, :L + 1])                      # [P, nr, L+1]
-                yr, yi = B["sh"].compute(rij / d.unsqueeze(1))                            # [P, (L+1)^2]
-                ne_, K = len(idx["atoms_e_cpu"][e]), P["kmax"]
-                Rd = Rp.new_zeros(ne_ * K, nr, L + 1).index_copy(0, P["dense"], Rp).view(ne_, K, nr, L + 1)
-                Y = torch.cat([yr, yi], 1)
-                Yd = Y.new_zeros(ne_ * K, Y.shape[1]).index_copy(0, P["dense"], Y).view(ne_, K, -1)
-                nlm = (L + 1) ** 2
-                ar, ai = [], []
-                for l in range(L + 1):
-                    Yl = torch.cat([Yd[:, :, l * l:(l + 1) ** 2], Yd[:, :, nlm + l * l:nlm + (l + 1) ** 2]], 2)
-                    Al = torch.bmm(Rd[:, :, :, l].transpose(1, 2), Yl)                    # [ne, nr, 2(2l+1)]
-                    ar.append(Al[:, :, :2 * l + 1])
-                    ai.append(Al[:, :, 2 * l + 1:])
-                blk_r[e][mu] = torch.cat(ar, 2).reshape(ne_, -1).index_select(1, B["nlm_idx"])
-                blk_i[e][mu] = torch.cat(ai, 2).reshape(ne_, -1).index_select(1, B["nlm_idx"])
+                yl = B["sh"].compute_blocks(rij / d.unsqueeze(1))              # per l: [P, 2(2l+1)] (Re, Im)
+                ne_ = len(idx["atoms_e_cpu"][e])
+                blocks = []
+                for l in range(B["L"] + 1):
+                    nl = B["n_l"][l]
+                    if nl:
+                        blocks.append(_SegOuter.apply(P["central_local"], ne_, g @ crad[:nl, l, :].t(), yl[l])
+                                      .reshape(ne_, -1))
+                Af = torch.cat(blocks, 1)
+                blk_r[e][mu] = Af.index_select(1, B["o_r"])
+                blk_i[e][mu] = Af.index_select(1, B["o_i"])
             elif B["has_A"]:
                 crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
                 R = torch.einsum("pk,nlk->pnl", g, crad).reshape(len(d), -1).index_select(1, B["nl_idx"])
@@ -391,45 +481,7 @@ class ACE:
                 z = lambda mu: torch.zeros(ne_, len(E["chan"][mu]), dtype=torch.float64, device=dev)
                 Ar = torch.cat([blk_r[e].get(mu, None) if mu in blk_r[e] else z(mu) for mu in sorted(E["chan"])], 1)
                 Ai = torch.cat([blk_i[e].get(mu, None) if mu in blk_i[e] else z(mu) for mu in sorted(E["chan"])], 1)
-                Bf = []
-                if _PRODUCTS == "gemm":
-                    nd, nc = E["nd"], E["ncols"]
-                    Tr = E["tree"]
-                    C = bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, nd)
-                    T = torch.zeros(Tr["nrows"] * nc, nd, dtype=torch.float64, device=dev).index_add(
-                        0, Tr["flat"], C.index_select(0, Tr["func"]) * Tr["gcg"].unsqueeze(1))
-                    T = T.view(Tr["nrows"], nc * nd)
-                    pr, pi = [Ar], [Ai]
-                    for parent, col in Tr["levels"]:
-                        a_r, a_i = pr[-1].index_select(1, parent), pi[-1].index_select(1, parent)
-                        b_r, b_i = Ar.index_select(1, col), Ai.index_select(1, col)
-                        pr.append(a_r * b_r - a_i * b_i)
-                        pi.append(a_i * b_r + a_r * b_i)
-                    Y = torch.cat([torch.cat(pr, 1), torch.cat(pi, 1)], 0) @ T          # [2 atoms, ncols*nd]
-                    Yr, Yi = Y[:ne_].view(ne_, nc, nd), Y[ne_:].view(ne_, nc, nd)
-                    rho = rho + (Ar.unsqueeze(2) * Yr - Ai.unsqueeze(2) * Yi).sum(1)
-                elif _COMPLEX_PROD:
-                    # native complex128: one gather + one fused complex multiply per factor
-                    Ac = torch.complex(Ar, Ai)
-                    for R in E["ranks"]:
-                        pc = Ac.index_select(1, R["idx"][0])
-                        for k in range(1, R["rank"] - 1):
-                            pc = pc * Ac.index_select(1, R["idx"][k])
-                        prod_r = torch.real(pc * Ac.index_select(1, R["idx"][-1]))
-                        Bf.append(torch.zeros(prod_r.shape[0], R["nfunc"], dtype=torch.float64, device=dev)
-                                  .index_add(1, R["msum"], prod_r * R["gcg"]))
-                for R in (E["ranks"] if _PRODUCTS == "real" else []):
-                    ar, ai = Ar.index_select(1, R["idx"][0]), Ai.index_select(1, R["idx"][0])
-                    for k in range(1, R["rank"] - 1):
-                        br, bi = Ar.index_select(1, R["idx"][k]), Ai.index_select(1, R["idx"][k])
-                        ar, ai = ar * br - ai * bi, ai * br + ar * bi
-                    br, bi = Ar.index_select(1, R["idx"][-1]), Ai.index_select(1, R["idx"][-1])
-                    prod_r = ar * br - ai * bi            # last factor: real part only
-                    Bf.append(torch.zeros(prod_r.shape[0], R["nfunc"], dtype=torch.float64, device=dev)
-                              .index_add(1, R["msum"], prod_r * R["gcg"]))
-                if Bf:
-                    Bm = torch.cat(Bf, dim=1)
-                    rho = rho + Bm @ bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, E["nd"])
+                rho = rho + self.products(E, Ar, Ai, bcoefs)
             safe = torch.where(rho != 0., rho, rho + 1e-32)
             en = 0.
             for p in range(E["nd"]):
