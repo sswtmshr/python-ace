@@ -4,7 +4,6 @@ import subprocess
 import sys
 from pathlib import Path
 import platform
-from distutils.version import LooseVersion
 from setuptools import Extension, setup, find_packages
 from setuptools.command.build_ext import build_ext
 from setuptools.command.install import install
@@ -192,12 +191,12 @@ setup(
                                           build_ext=CMakeBuild)),
     zip_safe=False,
     url='https://github.com/ICAMS/python-ace',
-    install_requires=['numpy<=1.26.4',
+    install_requires=['numpy<3',
                       'ase',
-                      'pandas<=2.0',
+                      'pandas>=2,<3',
                       'ruamel.yaml',
                       'psutil',
-                      'scikit-learn<=1.4.2'
+                      'scikit-learn'
                       ],
     classifiers=[
         'Programming Language :: Python :: 3',
@@ -211,5 +210,5 @@ setup(
              "bin/pace_activeset", "bin/pace_select",
              "bin/pace_collect", "bin/pace_augment", "bin/pace_corerep"],
 
-    python_requires=">=3.8"
+    python_requires=">=3.9"
 )

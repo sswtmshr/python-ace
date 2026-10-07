@@ -1,6 +1,7 @@
 import gc
 import json
 import logging
+import time
 
 from datetime import datetime
 from functools import partial
@@ -568,6 +569,7 @@ class GeneralACEFit:
                                  current_ladder_step=self.current_ladder_step),
                 test_dataframe=self.test_data
             )
+            self.flush_interim_potential(current_bbasisconfig, self.current_fit_cycle)
 
             log.info("Fitting cycle finished, final statistic:")
             self.fit_backend.last_fit_metric_data["cycle_step"] = self.current_fit_cycle
@@ -672,18 +674,41 @@ class GeneralACEFit:
         self.target_bbasisconfig.save(potential_filename)
         log.info("Final potential is saved to {}".format(potential_filename))
 
-    def callback_hook(self, basis_config: BBasisConfiguration, current_fit_cycle: int,
+    def callback_hook(self, basis_config, current_fit_cycle: int,
                       current_ladder_step: int):
-        # TODO add a list of callbacks
+        """basis_config: a BBasisConfiguration, or a zero-argument function returning one (built only if needed).
+        The built-in interim-potential save runs at most every `fit: interim_save_every_s` seconds (default 30;
+        0 = every iteration, as in stock pacemaker); the interim file is always rewritten when a fit returns
+        (flush_interim_potential). User callbacks run every iteration."""
+        cache = []
 
+        def get_config():
+            if not cache:
+                cache.append(basis_config() if callable(basis_config) else basis_config)
+            return cache[0]
+
+        every = float(self.fit_config.get("interim_save_every_s", 30))
+        now = time.time()
         for callback in self.callbacks:
+            if callback is save_interim_potential_callback:
+                if every > 0 and now - getattr(self, "_last_interim_save", 0.) < every:
+                    continue
+                self._last_interim_save = now
             callback(
-                basis_config=basis_config,
+                basis_config=get_config(),
                 current_fit_iteration=self.current_fit_iteration,
                 current_fit_cycle=current_fit_cycle,
                 current_ladder_step=current_ladder_step,
             )
         self.current_fit_iteration += 1
+
+    def flush_interim_potential(self, basis_config: BBasisConfiguration, current_fit_cycle: int):
+        """write interim_potential_<cycle>.yaml for the state a fit returned (the throttled callback may be older)"""
+        if save_interim_potential_callback in self.callbacks:
+            save_interim_potential(basis_config=basis_config,
+                                   potential_filename="interim_potential_{}.yaml".format(current_fit_cycle),
+                                   verbose=False)
+            self._last_interim_save = time.time()
 
     def predict(self, structures_dataframe=None, bbasisconfig=None):
         return self.fit_backend.predict(structures_dataframe=structures_dataframe, bbasisconfig=bbasisconfig)

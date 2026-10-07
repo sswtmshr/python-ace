@@ -5,7 +5,7 @@ import getpass  # for getpass.getuser()
 import glob
 import logging
 import os
-import pkg_resources
+from importlib.resources import files as _resource_files
 import re
 
 try:
@@ -107,6 +107,32 @@ def main(args):
 
     input_yaml_filename = args_parse.input
 
+    # ------------------------------------------------------------------ MPI
+    # Data-parallel training (PACEMAKER_MPI=1): every rank runs the identical
+    # optimizer; only rank 0 writes real output files. Non-root ranks are chdir'd
+    # into a private .mpi_rank_<n>/ sandbox so any file they write cannot clobber
+    # rank 0's outputs. Input paths are made absolute first so the chdir is safe.
+    try:
+        from pyace import mpi as _mpi
+    except Exception:
+        _mpi = None
+    _MPI_ON = (_mpi is not None) and _mpi.is_enabled()
+    _MPI_ROOT = (not _MPI_ON) or _mpi.is_root()
+    _ORIG_CWD = os.getcwd()
+    if _MPI_ON:
+        log.info("MPI: %s", _mpi.summary())
+        input_yaml_filename = os.path.abspath(input_yaml_filename)
+        for _k in ("potential", "initial_potential", "data"):
+            if _k in args_parse:
+                _v = getattr(args_parse, _k)
+                if isinstance(_v, str) and os.path.exists(_v):
+                    setattr(args_parse, _k, os.path.abspath(_v))
+        if not _MPI_ROOT:
+            _sandbox = os.path.join(_ORIG_CWD, ".mpi_rank_%d" % _mpi.rank())
+            os.makedirs(_sandbox, exist_ok=True)
+            os.chdir(_sandbox)
+            logging.getLogger().setLevel(logging.ERROR)
+
     if not args_parse.verbose_tf:
         os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
@@ -189,6 +215,14 @@ def main(args):
             data_config["datapath"] = env_data_path
             log.info("Data path set to $PACEMAKERDATAPATH = {}".format(env_data_path))
 
+    # MPI: resolve the dataset path against the launch dir before any rank chdir's
+    if _MPI_ON and isinstance(data_config, dict):
+        _dp = data_config.get("datapath")
+        _fn = data_config.get("filename")
+        if _fn is not None and not os.path.isabs(_fn) and not (_dp and os.path.isabs(_dp)):
+            data_config["filename"] = os.path.join(_ORIG_CWD, _dp or "", _fn)
+            log.info("MPI: resolved dataset path -> {}".format(data_config["filename"]))
+
     # backend section
     backend_config = {}
     if "backend" in args_yaml:
@@ -208,7 +242,7 @@ def main(args):
     else:
         backend_config['evaluator'] = 'pyace'
         evaluator_name = backend_config['evaluator']
-        log.info("Couldn't find evaluator ('pyace' or 'tensorpot').")
+        log.info("Couldn't find evaluator ('pyace', 'tensorpot' or 'torch').")
         log.info("Default evaluator `{}` would be used, ".format(evaluator_name) +
                  " otherwise please specify in YAML:backend:evaluator or as -b <evaluator>")
 
@@ -245,9 +279,15 @@ def main(args):
         sys.exit(0)
 
     if not args_parse.no_fit:
-        general_fit.fit()
-        general_fit.set_core_rep(general_fit.target_bbasisconfig)
-        general_fit.save_optimized_potential(output_file_name)
+        general_fit.fit()  # collective: every MPI rank participates
+        if _MPI_ROOT:
+            general_fit.set_core_rep(general_fit.target_bbasisconfig)
+            general_fit.save_optimized_potential(output_file_name)
+
+    if _MPI_ON and not _MPI_ROOT:
+        # non-root ranks are done; skip the (serial, root-only) prediction/plots.
+        # No barrier: root may finish and finalize independently.
+        return
 
     if not args_parse.no_predict:
         log.info("Making predictions")
@@ -343,7 +383,7 @@ def generate_template_input():
         weighting = None
         print("Use UniformWeightingPolicy")
 
-    template_input_yaml_filename = pkg_resources.resource_filename('pyace.data', 'input_template.yaml')
+    template_input_yaml_filename = str(_resource_files('pyace.data').joinpath('input_template.yaml'))
     copyfile(template_input_yaml_filename, "input.yaml")
     with open("input.yaml", "r") as f:
         input_yaml_text = f.read()
@@ -383,7 +423,7 @@ def predict_and_save(general_fit, target_bbasisconfig, structures_dataframe, fna
     if general_fit.evaluator_name == "pyace" and "atomic_env" in structures_dataframe.columns:
         log.info("Computing nearest neighbours distances from 'atomic_env'")
         structures_dataframe["nn_min"] = structures_dataframe["atomic_env"].map(calculate_minimal_nn_atomic_env)
-    elif general_fit.evaluator_name == "tensorpot" and "tp_atoms" in structures_dataframe.columns:
+    elif general_fit.evaluator_name in ("tensorpot", "torch") and "tp_atoms" in structures_dataframe.columns:
         log.info("Computing nearest neighbours distances from 'tp_atoms'")
         structures_dataframe["nn_min"] = structures_dataframe["tp_atoms"].map(calculate_minimal_nn_tp_atoms)
     else:

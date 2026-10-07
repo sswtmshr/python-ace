@@ -645,10 +645,10 @@ class ACEDataset:
                 log.info("Elements-to-indices mapping for 'atomic_env' construction is NOT provided")
             self.add_ase_atoms_transformer(ATOMIC_ENV_DF_COLUMN, aseatoms_to_atomicenvironment, cutoff=cutoff,
                                            elements_mapper_dict=elements_mapper_dict)
-        elif evaluator_name == TENSORPOT_EVAL:
+        elif evaluator_name in (TENSORPOT_EVAL, TORCH_EVAL):
             self.add_ase_atoms_transformer(TP_ATOMS_DF_COLUMN, generate_tp_atoms, cutoff=cutoff, verbose=False)
         else:
-            raise ValueError(f"Unknown evaluator type '{evaluator_name}', only '{TENSORPOT_EVAL}' is supported")
+            raise ValueError(f"Unknown evaluator type '{evaluator_name}', only '{TENSORPOT_EVAL}' and '{TORCH_EVAL}' are supported")
 
         self.prepare_datasets()
 

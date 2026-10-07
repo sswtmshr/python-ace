@@ -53,6 +53,37 @@ def attach_stress_weights(df, w_stress):
     log.info("Stress fit: w_stress = {}, {} of {} structures with a stress label".format(w_stress, n, len(df)))
 
 
+
+def _tp_backend(evaluator_name):
+    """(ACE, TensorPotential, FitTensorPotential, init_gpu_config, constants module, OOM exception types) of the
+    TensorFlow ('tensorpot') or PyTorch ('torch') backend; both have the same interface."""
+    if evaluator_name == TORCH_EVAL:
+        import torch
+        import pacetorch
+        from pacetorch.ace import ACE
+        from pacetorch.potential import TorchPotential
+        from pacetorch.fit import FitTorchPotential
+        import pacetorch.constants as C
+        oom = tuple(t for t in (getattr(torch, "OutOfMemoryError", None),
+                                getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)) if t is not None)
+
+        def make_ace(bconf, **kw):
+            return ACE(bconf, device=pacetorch.select_device(make_ace.gpu_config), **kw)
+        make_ace.gpu_config = None
+
+        def init_gpu_config(cfg):
+            make_ace.gpu_config = cfg
+            return cfg
+        return make_ace, TorchPotential, FitTorchPotential, init_gpu_config, C, oom
+    from tensorpotential.potentials.ace import ACE
+    from tensorpotential.tensorpot import TensorPotential
+    from tensorpotential.fit import FitTensorPotential
+    from tensorpotential.utils.utilities import init_gpu_config
+    import tensorpotential.constants as C
+    import tensorflow as tf
+    return ACE, TensorPotential, FitTensorPotential, init_gpu_config, C, \
+        (tf.errors.ResourceExhaustedError, tf.errors.InternalError)
+
 class FitBackendAdapter:
 
     def __init__(self, backend_config: Union[Dict, BackendConfig], loss_spec: LossFunctionSpecification = None,
@@ -104,8 +135,8 @@ class FitBackendAdapter:
         self.trainable_parameters_dict = trainable_parameters_dict
         self.bbasisconfig = bbasisconfig
 
-        if self.backend_config.evaluator_name == TENSORPOT_EVAL:
-            from tensorflow.python.framework.errors_impl import ResourceExhaustedError, InternalError
+        if self.backend_config.evaluator_name in (TENSORPOT_EVAL, TORCH_EVAL):
+            oom_errors = _tp_backend(self.backend_config.evaluator_name)[5]
             while True:
                 try:
                     self.setup_tensorpot(bbasisconfig, dataframe, loss_spec, trainable_parameters_dict)
@@ -114,7 +145,7 @@ class FitBackendAdapter:
                                                      test_dataframe=test_dataframe)
                     self.log_optimization_result()
                     return fit_res
-                except (ResourceExhaustedError, InternalError) as e:
+                except oom_errors as e:
                     log.error("{} errors encountered".format(e))
                     if self.backend_config.get(BACKEND_BATCH_SIZE_REDUCTION_KW, True):
                         batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
@@ -171,6 +202,9 @@ class FitBackendAdapter:
             if self.backend_config.evaluator_name == TENSORPOT_EVAL:
                 import tensorpotential
                 return {TENSORPOT_EVAL + "_version": tensorpotential.__version__}
+            elif self.backend_config.evaluator_name == TORCH_EVAL:
+                import pacetorch, torch
+                return {"pacetorch_version": pacetorch.__version__, "torch_version": torch.__version__}
             elif self.backend_config.evaluator_name == PYACE_EVAL:
                 from pyace import __version__, get_ace_evaluator_version
                 return {PYACE_EVAL + "_version": __version__, "ace_evaluator_version": get_ace_evaluator_version()}
@@ -184,12 +218,11 @@ class FitBackendAdapter:
                         loss_spec: LossFunctionSpecification,
                         trainable_parameters_dict: Dict
                         ) -> BBasisConfiguration:
-        from tensorpotential.potentials.ace import ACE
-        from tensorpotential.tensorpot import TensorPotential
-        from tensorpotential.fit import FitTensorPotential
-        from tensorpotential.utils.utilities import batching_data, init_gpu_config
-        from tensorpotential.constants import (LOSS_TYPE, LOSS_FORCE_FACTOR, LOSS_ENERGY_FACTOR, L1_REG,
-                                               L2_REG, AUX_LOSS_FACTOR, LOSS_STRESS_FACTOR)
+        ACE, TensorPotential, FitTensorPotential, init_gpu_config, C, _ = _tp_backend(
+            self.backend_config.evaluator_name)
+        LOSS_TYPE, LOSS_FORCE_FACTOR, LOSS_ENERGY_FACTOR, L1_REG, L2_REG, AUX_LOSS_FACTOR, LOSS_STRESS_FACTOR = (
+            C.LOSS_TYPE, C.LOSS_FORCE_FACTOR, C.LOSS_ENERGY_FACTOR, C.L1_REG, C.L2_REG, C.AUX_LOSS_FACTOR,
+            C.LOSS_STRESS_FACTOR)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -200,8 +233,8 @@ class FitBackendAdapter:
             log.info("Batch size: {}".format(batch_size))
             w_stress = float(getattr(loss_spec, "w_stress", 0) or 0)
             attach_stress_weights(dataframe, w_stress)
-            batches = batching_data(dataframe, batch_size=batch_size)
-            n_batches = len(batches)
+            # number of batches the fitter will build (structures without neighbour list are dropped there)
+            n_batches = max(1, int(np.ceil(int(dataframe["tp_atoms"].notna().sum()) / max(1, int(batch_size)))))
             loss_force_factor = loss_spec.kappa
             has_smoothness = (np.array([loss_spec.w0_rad, loss_spec.w1_rad, loss_spec.w2_rad]) != 0).any()
             has_orthogonality = loss_spec.w_orth != 0
@@ -243,8 +276,9 @@ class FitBackendAdapter:
         with warnings.catch_warnings():
             # adapt call of self._callback(current_bbasisconfig) from FitTensorPotential.callback(coeffs)
             def adapted_callback(coeffs):
-                new_config = self.fitter.tensorpot.potential.get_updated_config(updating_coefs=coeffs)
-                self._callback(new_config)
+                # the BBasisConfiguration is built only if a callback needs it (GeneralACEFit.callback_hook)
+                coeffs = np.array(coeffs, copy=True)
+                self._callback(lambda: self.fitter.tensorpot.potential.get_updated_config(updating_coefs=coeffs))
 
             jacobian_factor = compute_bbasisset_train_mask(bbasisconfig, trainable_parameters_dict)
             if np.all(jacobian_factor):
@@ -323,13 +357,13 @@ class FitBackendAdapter:
         if bbasisconfig is None:
             raise ValueError("`bbasisconfig` couldn't be None for FitAdapter.setup_backend_for_predict")
         log.info("Setting {} backend for predicting".format(self.backend_config.evaluator_name))
-        if self.backend_config.evaluator_name == TENSORPOT_EVAL:
-            from tensorpotential.potentials.ace import ACE
-            from tensorpotential.tensorpot import TensorPotential
-            from tensorpotential.fit import FitTensorPotential
-            ace_pot = ACE(bbasisconfig)
-            tp = TensorPotential(ace_pot)
-            self.fitter = FitTensorPotential(tensorpot=tp, eager=True)
+        if self.backend_config.evaluator_name in (TENSORPOT_EVAL, TORCH_EVAL):
+            ACE, TensorPotential, FitTensorPotential, init_gpu_config, _, _ = _tp_backend(
+                self.backend_config.evaluator_name)
+            init_gpu_config(self.backend_config.get(BACKEND_GPU_CONFIG, None))
+            tp = TensorPotential(ACE(bbasisconfig))
+            self.fitter = FitTensorPotential(tp, eager=True)
+            self.fitter.batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
         elif self.backend_config.evaluator_name == PYACE_EVAL:
             from pyace import PyACEFit
             self.fitter = PyACEFit(bbasisconfig)
@@ -337,7 +371,9 @@ class FitBackendAdapter:
             raise ValueError('{0} is not a valid evaluator'.format(self.backend_config.evaluator_name))
 
     def predict(self, structures_dataframe=None, bbasisconfig=None):
-        if self.fitter is None:
+        # an explicit potential always wins: after a fit the fitter holds the LAST cycle's coefficients,
+        # not necessarily the saved (best) potential
+        if self.fitter is None or bbasisconfig is not None:
             self.setup_backend_for_predict(bbasisconfig)
         return self.fitter.predict(structures_dataframe)
 
@@ -391,7 +427,7 @@ class FitBackendAdapter:
 
     @property
     def last_loss(self):
-        if self.backend_config.evaluator_name == TENSORPOT_EVAL:
+        if self.backend_config.evaluator_name in (TENSORPOT_EVAL, TORCH_EVAL):
             return self.fitter.loss_history[-1]
         elif self.backend_config.evaluator_name == PYACE_EVAL:
             return self.fitter.last_loss

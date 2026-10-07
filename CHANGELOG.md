@@ -12,6 +12,9 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 |---|---|---|---|---|
 | upstream TensorFlow (start) | | 20.0 | 22.9 GiB | single GPU only |
 | 1 multinode (TensorFlow) | 2026-08-31 | | | 6.3 s/eval on 4 A100s |
+| 3 PyTorch backend | 2026-10-06 | 13.7* | 32.4 GiB* | 3.75 s/eval on 4 A100s |
+
+- \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 
 ### 1. Multi-GPU / multi-node fitting with MPI, TensorFlow backend (2026-08-31)
 
@@ -29,3 +32,15 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - `fit: loss: w_stress` compares the 6 Voigt components (eV/A^3, ASE sign) of sigma = sym(h^T dE/dh)/V at fixed
   fractional coordinates, in one tape pass; weights uniform over the periodic structures with a stress label.
 - Cost: +1-3% time. With `w_stress: 0` the behaviour is upstream's.
+
+### 3. PyTorch backend, with MPI (2026-10-06)
+
+- Problem: TensorFlow rebuilt index bookkeeping and batch data on every call (~2.6 s/eval of host work); upstream's
+  pins (numpy, pandas, scikit-learn, Python) and `distutils`/`pkg_resources` blocked current Python.
+- Change: `pacetorch`, a drop-in backend with the same coefficient layout, so every file pacemaker writes is
+  unchanged. Indices are built once per batch, batch data is uploaded to the GPU once, and the A-basis keeps only the
+  channels the product basis uses (62%). MPI as in 1, for the torch backend; each rank's GPU is pinned by the launch
+  line (`CUDA_VISIBLE_DEVICES=$SLURM_LOCALID`).
+- Effect: 20.0 -> **13.7 s/eval** (same A100, same job); 4 A100s **3.75 s/eval** vs **6.3** for TensorFlow (1).
+  Agreement with TensorFlow: energies 3e-14 eV/at, forces 2e-13 eV/A, stress 4e-12 GPa, gradient 9e-14. 4 ranks
+  reproduce 1 rank to 1e-14.

@@ -33,6 +33,7 @@ ATOMIC_ENV_DF_COLUMN = "atomic_env"
 TP_ATOMS_DF_COLUMN = "tp_atoms"
 PYACE_EVAL = 'pyace'
 TENSORPOT_EVAL = 'tensorpot'
+TORCH_EVAL = 'torch'
 ENERGYBASED_WEIGHTING_POLICY = "EnergyBasedWeightingPolicy"
 EXTERNAL_WEIGHTING_POLICY = "ExternalWeightingPolicy"
 WEIGHTING_TYPE_KW = "type"
