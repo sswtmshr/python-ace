@@ -4,6 +4,9 @@ A fork of [ICAMS/python-ace](https://github.com/ICAMS/python-ace) (pacemaker), w
 `TensorPotential/`. Same model, `input.yaml` and potential files as upstream. The original
 pacemaker README follows at the end.
 
+**Compatibility rule.** An `input.yaml` that runs with upstream pacemaker runs here unchanged and means the same
+thing; new features are optional keys. Results differ from upstream only where upstream was wrong.
+
 ## Install
 
 Install the backend you use (or both).
@@ -73,7 +76,7 @@ fit:
   EnergyBasedWeightingPolicy -> the energy weights, ExternalWeightingPolicy -> its `w_stress` column. They are
   normalised over the fully periodic structures with a finite stress label.
 - Both GPU backends fit stress. Stress errors are printed and written with the energy and force metrics.
-- An unknown key in `fit: loss:` is an error, so a typo cannot silently do nothing.
+- An unknown key in `fit: loss:` is accepted with a warning.
 
 ## Multi-GPU / multi-node fitting
 
@@ -103,8 +106,10 @@ fit:
   bfgs_checkpoint_every: 10        # iterations between saves
 ```
 
-- BFGS runs natively: scipy's line search and stopping rules with an O(N^2) update instead of scipy's O(N^3).
-  `fit: options: {native_bfgs: false}` uses scipy's.
+- BFGS runs natively: scipy's line search and stopping rules with the inverse Hessian updated in place, O(N^2),
+  on the GPU when there is one (3 ms per iteration at N = 9640, scipy: seconds). Checkpoints are written at most
+  every 60 s. `fit: options: {native_bfgs: false}`, or scipy-only options, use scipy's BFGS. The TensorFlow
+  backend keeps scipy's BFGS.
 - `PACE_DEADLINE` (unix time of the job's end) and `PACE_MARGIN` (seconds before it, default 240): the fit saves and
   stops before the deadline and leaves `BFGS_PAUSED`. The next run with the same checkpoint continues with the saved
   curvature, from the potential you give it (for example the last interim potential).

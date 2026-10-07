@@ -8,8 +8,8 @@ Differences from the TF implementation are in how the same numbers are computed,
   * all index bookkeeping (bond-type partition, atom->element, unique central atoms) is done once per batch on the
     host (prepare_batch), instead of dynamic_partition / tf.unique / tf.where inside every evaluation;
   * the atomic base A is built only for the (mu_j, n, l, m) channels the product basis actually uses, with no padding
-    to nradmax/lmax; on a GPU (PACETORCH_ABASIS=auto/outer) as segmented outer products with hand-written derivatives
-    and fused Triton kernels, never materialising [pairs, channels] arrays; otherwise pairs are scatter-added;
+    to nradmax/lmax, as segmented outer products with hand-written derivatives (fused Triton kernels on a GPU), never
+    materialising [pairs, channels] arrays;
   * the product basis shares common partial products (a prefix tree) and does the last factor of all ms-combinations
     of all functions as one matrix multiply, of which only the real part is needed (ACE.products).
 """
@@ -23,21 +23,12 @@ import os
 from pacetorch import _kernels
 from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding, radial_function
 
-# A-basis construction (identical results):
-#   "outer"   segmented outer products with hand-written derivatives (_SegOuter), run by fused Triton kernels on a
-#             GPU (_kernels.py): A100, SiC batch 94: 1.5x faster and 2.3x less memory than scatter
-#   "scatter" per-pair products + index_add, plain autograd: faster than outer where the kernels cannot run (outer
-#             then uses its torch formulation, which needs less memory but is slower)
-#   "auto"    (default) outer where the Triton kernels run, scatter elsewhere (CPU, no Triton)
-_ABASIS = os.environ.get("PACETORCH_ABASIS", "auto")
-if _ABASIS not in ("auto", "outer", "scatter"):
-    raise ValueError("PACETORCH_ABASIS={}: use auto, outer or scatter".format(_ABASIS))
-# PACETORCH_TRITON=0: never use the kernels (outer then always runs its torch formulation; auto picks scatter)
+# A-basis: segmented outer products with hand-written derivatives (_SegOuter), run by fused Triton kernels on a GPU
+# (_kernels.py; PACETORCH_TRITON=0 forces the torch formulation, which is also what runs on CPU).
+# Measured against the plain-autograd scatter formulation it replaced: GPU 1.5x faster with Triton (8% without),
+# 2.3x less memory; CPU 1.5x faster. That formulation remains only as the reference for the tests (_REFERENCE_ABASIS).
 _TRITON = os.environ.get("PACETORCH_TRITON", "1") != "0"
-
-
-def _use_outer(t):
-    return _ABASIS == "outer" or (_ABASIS == "auto" and _TRITON and _kernels.available(t))
+_REFERENCE_ABASIS = False      # tests only: plain-autograd per-pair products + index_add
 
 _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12,
       'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23,
@@ -468,7 +459,7 @@ class ACE:
                     r1 = torch.nn.functional.pad(r1, (0, nd_max - B["nd"]))
                 rho1[e] = rho1[e] + r1
             # A_{mu n l m}: R_nl(r) Y_lm(rhat), only the used channels
-            if B["has_A"] and _use_outer(g):
+            if B["has_A"] and not _REFERENCE_ABASIS:
                 crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
                 yl = B["sh"].compute_blocks(rij / d.unsqueeze(1))              # per l: [P, 2(2l+1)] (Re, Im)
                 ne_ = len(idx["atoms_e_cpu"][e])

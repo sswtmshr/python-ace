@@ -21,8 +21,11 @@ class LossFunctionSpecification:
         # stress term: w_stress * sum_struct w_s * |sigma_pred - sigma_ref|^2 (6 Voigt, eV/A^3),
         # w_s = 1/N over the periodic structures with a stress label. 0 = off (stock behaviour)
         self.w_stress = w_stress
-        if kwargs:
-            raise ValueError("unknown fit: loss: keys {}".format(sorted(kwargs)))
+        if kwargs:   # stock pacemaker ignores them silently; keep inputs that run there running, but say so
+            import logging
+            logging.getLogger(__name__).warning(
+                "fit: loss: keys {} are not used by this pacemaker (misspelled? recognised: kappa, L1_coeffs, L2_coeffs, "
+                "w0_rad, w1_rad, w2_rad, w_orth, w_stress)".format(sorted(kwargs)))
 
     def __str__(self):
         return ("LossFunctionSpecification(kappa={kappa}, L1={L1_coeffs}, " +

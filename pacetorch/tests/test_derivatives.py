@@ -6,8 +6,8 @@
    and a third-order quantity against plain autograd.
 2. ACE.products (prefix tree + GEMM) against the direct per-ms-combination product, with first and second
    derivatives, for every element of a random two-element basis.
-3. Whole model on random SiC structures: both A-basis paths (outer, scatter) give the same energies, forces, stress,
-   loss and loss gradient."""
+3. Whole model on random SiC structures: the A-basis (outer products, hand-written derivatives) against the
+   plain-autograd reference formulation: same energies, forces, stress, loss and loss gradient."""
 import numpy as np
 import torch
 
@@ -46,10 +46,10 @@ def test_triton_kernels_match_torch():
     bconf, b = _model_and_batch()
     specs = {"loss_force_factor": 0.3, "loss_energy_factor": 0.7, "loss_stress_factor": 0.5}
     out = {}
-    saved = A._ABASIS, A._TRITON
+    saved = A._TRITON
     try:
         for tri in (False, True):
-            A._ABASIS, A._TRITON = "outer", tri
+            A._TRITON = tri
             ace = A.ACE(bconf, device="cuda")
             c0 = ace.get_coefs()
             ace.set_coefs(c0 + np.random.default_rng(2).normal(scale=0.3, size=c0.shape))
@@ -57,7 +57,7 @@ def test_triton_kernels_match_torch():
             out[tri] = [x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
                         for x in tp.loss_and_grad(tp.device_batch(b))]
     finally:
-        A._ABASIS, A._TRITON = saved
+        A._TRITON = saved
     for name, a, r in zip(("loss", "grad", "E", "F", "stress"), out[True], out[False]):
         err = np.max(np.abs(a - r)) / max(np.max(np.abs(r)), 1e-300)
         assert err < 1e-11, "{}: relative difference {:.2e}".format(name, err)
@@ -166,10 +166,10 @@ def test_abasis_paths_agree():
     bconf, b = _model_and_batch()
     specs = {"loss_force_factor": 0.3, "loss_energy_factor": 0.7, "loss_stress_factor": 0.5}
     out = {}
-    saved = A._ABASIS
+    saved = A._REFERENCE_ABASIS
     try:
         for ab in ("scatter", "outer"):
-            A._ABASIS = ab
+            A._REFERENCE_ABASIS = ab == "scatter"
             ace = A.ACE(bconf)
             c0 = ace.get_coefs()        # random coefficients (radial ones are shared by (a,b) and (b,a))
             ace.set_coefs(c0 + np.random.default_rng(2).normal(scale=0.3, size=c0.shape))
@@ -177,7 +177,7 @@ def test_abasis_paths_agree():
             loss, g, e, f, s = tp.loss_and_grad(tp.device_batch(b))
             out[ab] = [x.numpy() if torch.is_tensor(x) else np.asarray(x) for x in (loss, g, e, f, s)]
     finally:
-        A._ABASIS = saved
+        A._REFERENCE_ABASIS = saved
     for name, a, r in zip(("loss", "grad", "E", "F", "stress"), out["outer"], out["scatter"]):
         err = np.max(np.abs(a - r)) / max(np.max(np.abs(r)), 1e-300)
         assert err < 1e-11, "{}: relative difference {:.2e}".format(name, err)

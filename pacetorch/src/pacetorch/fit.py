@@ -183,13 +183,20 @@ class FitTorchPotential:
             log.info("Minimizer options: {}".format(options))
             self.fit_metrics_data_dict = {}
             native = bool(options.pop("native_bfgs", True)) and optimizer == "BFGS"
+            if native:
+                from pyace.bfgs import use_scipy
+                only_scipy = use_scipy(options)
+                if only_scipy:   # an input written for stock pacemaker with scipy-only BFGS options: run scipy's BFGS
+                    log.info("BFGS options {} exist only in scipy: using scipy.optimize BFGS".format(only_scipy))
+                    native = False
             try:
                 if native:   # O(N^2) update, optional checkpoint/pause (pyace.bfgs); same iterates as scipy BFGS
                     from pyace.bfgs import minimize_bfgs
                     res_opt = minimize_bfgs(self.fit_func, coefs, args=(batches,), callback=self.callback,
-                                            options=options, tag=self.tensorpot.loss_specs[LOSS_FORCE_FACTOR])
+                                            options=dict(options, device=self.tensorpot.device),
+                                            tag=self.tensorpot.loss_specs[LOSS_FORCE_FACTOR])
                 else:
-                    options.pop("checkpoint", None), options.pop("checkpoint_every", None)
+                    [options.pop(k, None) for k in ("checkpoint", "checkpoint_every", "checkpoint_min_s", "device")]
                     res_opt = minimize(self.fit_func, coefs, method=optimizer, jac=True, args=(batches,),
                                        options=options, callback=self.callback)
             except StopIteration as e:   # pacemaker early stopping raised inside the callback

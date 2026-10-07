@@ -18,6 +18,7 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | 10 prefix-tree products | 2026-10-07 | 10.33 | 27.17 GiB | |
 | 11 hand-written A-basis derivatives | 2026-10-07 | | 11.68 GiB | |
 | 12 Triton kernels | 2026-10-07 | 6.88 | 11.66 GiB | |
+| 15 BFGS matrix on the GPU | 2026-10-07 | | | 1.99 s/BFGS step on 4 A100s (was 2.27) |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 - \*\* measured after 7 and 8, which do not change memory (32.39 -> 30.75 GiB: the int32 index arrays).
@@ -125,3 +126,11 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - Bug: only the rank that ran out of memory reduced its batch size, so the ranks desynchronised.
 - Change: out-of-memory is decided collectively. The restart is from the last *accepted* BFGS step; upstream used the
   last evaluated point, which could be a rejected line-search trial.
+
+### 15. BFGS inverse Hessian on the GPU (2026-10-07)
+
+- Problem: even at O(N^2), numpy took 0.52 s per step at N = 9640.
+- Change: an in-place update on rank 0's GPU (BLAS `dger` on CPU); checkpoints at most every 60 s (709 MB, 1 s).
+  Upstream inputs run unchanged: unknown `fit: loss:` keys warn, scipy-only options go to scipy.
+- Effect: 0.52 s -> 3 ms (GPU) / 0.14 s (CPU) per update. A whole BFGS step, 4 A100s, N = 5640: 2.267 -> 1.992 s,
+  same final loss to 12 digits (job 59477031).

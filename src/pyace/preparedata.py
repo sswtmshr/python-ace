@@ -524,7 +524,8 @@ def train_test_split(df, test_size: Union[float, int]) -> Tuple[pd.DataFrame, pd
     elif 0 < test_size and test_size < 1:
         frac, test_size = test_size, int(n_samples * test_size)
         if test_size == 0:
-            raise ValueError("test_size = {} of {} structures is an empty test set".format(frac, n_samples))
+            log.warning("test_size = {} of {} structures is an empty test set: no test set".format(frac, n_samples))
+            return df, None
         train_size = n_samples - test_size
     else:
         raise ValueError("test_size = {}: must be a fraction in (0, 1) or a number of structures; leave it out for "
