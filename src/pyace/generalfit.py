@@ -1,5 +1,6 @@
 import gc
 import json
+from pyace import mpi as _mpi   # data-parallel runs: only rank 0 writes files (identity without MPI)
 import logging
 import time
 
@@ -123,7 +124,8 @@ def save_dataset(dataframe, fname):
 
     columns_to_save = [col for col in fitting_data_columns if col not in columns_to_drop]
 
-    dataframe[columns_to_save].to_pickle(fname, compression="gzip", protocol=4)
+    if _mpi.is_root():
+        dataframe[columns_to_save].to_pickle(fname, compression="gzip", protocol=4)
     log.info("Dataset saved into {}".format(fname))
 
 
@@ -255,7 +257,7 @@ class GeneralACEFit:
                  "str (YAML file name) or BBasisConfiguration are supported").format(
                     type(potential_config)))
         # save target_potential.yaml
-        self.target_bbasisconfig.save(TARGET_POTENTIAL_YAML)
+        _save_config(self.target_bbasisconfig, TARGET_POTENTIAL_YAML)
 
         if FIT_LADDER_STEP_KW in fit_config and not self.ladder_scheme:
             if self.initial_bbasisconfig is None:
@@ -327,7 +329,7 @@ class GeneralACEFit:
                                           evaluator_name=self.evaluator_name, )
             if self.ace_dataset.reference_energy is not None:
                 self.target_bbasisconfig.metadata[REFERENCE_ENERGY] = json.dumps(self.ace_dataset.reference_energy)
-                self.target_bbasisconfig.save(TARGET_POTENTIAL_YAML)
+                _save_config(self.target_bbasisconfig, TARGET_POTENTIAL_YAML)
                 log.info(f"Saving '{REFERENCE_ENERGY}' to potential metadata")
             self.fitting_data = self.ace_dataset.fitting_data
             self.test_data = self.ace_dataset.test_data
@@ -467,7 +469,7 @@ class GeneralACEFit:
 
     def fit(self) -> BBasisConfiguration:
         gc.collect()
-        self.target_bbasisconfig.save(TARGET_POTENTIAL_YAML)
+        _save_config(self.target_bbasisconfig, TARGET_POTENTIAL_YAML)
 
         log.info("Fitting dataset size: {} structures / {} atoms".format(len(self.fitting_data),
                                                                          self.fitting_data["NUMBER_OF_ATOMS"].sum()))
@@ -501,7 +503,7 @@ class GeneralACEFit:
                                                                           return_is_extended=True)
             new_func_num = current_bbasisconfig.total_number_of_functions
             log.info("Extended basis set size: {} B-functions".format(new_func_num))
-            current_bbasisconfig.save("current_extended_potential.yaml")
+            _save_config(current_bbasisconfig, "current_extended_potential.yaml")
             log.info("Extended basis set saved to current_extended_potential.yaml")
             if not is_extended:
                 log.info("No new function added after basis extension. Stopping")
@@ -584,7 +586,7 @@ class GeneralACEFit:
 
             if randomize_func_coeffs_abs_sigma > 0:  # randomize func coeffs mode
                 ens_pot_fname = "ensemble_potential_{}.yaml".format(self.current_fit_cycle)
-                current_bbasisconfig.save(ens_pot_fname)
+                _save_config(current_bbasisconfig, ens_pot_fname)
                 log.info("Ensemble potential is saved to {}".format(ens_pot_fname))
 
             finished_fit_cycles = self.current_fit_cycle + 1
@@ -671,7 +673,7 @@ class GeneralACEFit:
             del self.target_bbasisconfig.metadata["_" + FIT_FIT_CYCLES_KW]
 
         log.debug("Update metadata: {}".format(self.target_bbasisconfig.metadata))
-        self.target_bbasisconfig.save(potential_filename)
+        _save_config(self.target_bbasisconfig, potential_filename)
         log.info("Final potential is saved to {}".format(potential_filename))
 
     def callback_hook(self, basis_config, current_fit_cycle: int,
@@ -745,11 +747,19 @@ def safely_update_bbasisconfiguration_coefficients(coeffs: np.array, config: BBa
     config.set_all_coeffs(current_coeffs)
 
 
+def _save_config(basis_config: BBasisConfiguration, filename: str):
+    """BBasisConfiguration.save on rank 0 only"""
+    if _mpi.is_root():
+        basis_config.save(filename)
+
+
 def save_interim_potential(basis_config: BBasisConfiguration, coeffs=None, potential_filename="interim_potential.yaml",
                            verbose=True):
     if coeffs is not None:
         basis_config = basis_config.copy()
         safely_update_bbasisconfiguration_coefficients(coeffs, basis_config)
+    if not _mpi.is_root():
+        return
     basis_config.metadata["intermediate_time"] = str(datetime.now())
     basis_config.save(potential_filename)
     if verbose:
@@ -780,6 +790,8 @@ def active_import(name):
 
 
 def plot_ef_distributions(df, suffix=""):
+    if not _mpi.is_root():
+        return
     try:
         import matplotlib.pylab as plt
 

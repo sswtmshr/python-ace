@@ -108,29 +108,19 @@ def main(args):
     input_yaml_filename = args_parse.input
 
     # ------------------------------------------------------------------ MPI
-    # Data-parallel training (PACEMAKER_MPI=1): every rank runs the identical
-    # optimizer; only rank 0 writes real output files. Non-root ranks are chdir'd
-    # into a private .mpi_rank_<n>/ sandbox so any file they write cannot clobber
-    # rank 0's outputs. Input paths are made absolute first so the chdir is safe.
+    # Data-parallel training (PACEMAKER_MPI=1, one rank per GPU): every rank runs the identical optimizer on its
+    # share of the batches. Only rank 0 writes files: the write sites in pyace (potentials, metrics files, data
+    # pickles, plots) are guarded with pyace.mpi.is_root(), non-root ranks get no log file and only log errors,
+    # and they stop after the fit (prediction and plots are rank-0 work).
     try:
         from pyace import mpi as _mpi
     except Exception:
         _mpi = None
     _MPI_ON = (_mpi is not None) and _mpi.is_enabled()
     _MPI_ROOT = (not _MPI_ON) or _mpi.is_root()
-    _ORIG_CWD = os.getcwd()
     if _MPI_ON:
         log.info("MPI: %s", _mpi.summary())
-        input_yaml_filename = os.path.abspath(input_yaml_filename)
-        for _k in ("potential", "initial_potential", "data"):
-            if _k in args_parse:
-                _v = getattr(args_parse, _k)
-                if isinstance(_v, str) and os.path.exists(_v):
-                    setattr(args_parse, _k, os.path.abspath(_v))
         if not _MPI_ROOT:
-            _sandbox = os.path.join(_ORIG_CWD, ".mpi_rank_%d" % _mpi.rank())
-            os.makedirs(_sandbox, exist_ok=True)
-            os.chdir(_sandbox)
             logging.getLogger().setLevel(logging.ERROR)
 
     if not args_parse.verbose_tf:
@@ -164,7 +154,7 @@ def main(args):
 
     output_file_name = args_parse.output
 
-    if "log" in args_parse:
+    if "log" in args_parse and _MPI_ROOT:
         log_file_name = args_parse.log
         log.info("Redirecting log into file {}".format(log_file_name))
         fileh = logging.FileHandler(log_file_name, 'a')
@@ -214,14 +204,6 @@ def main(args):
         if not data_config.get("datapath"):
             data_config["datapath"] = env_data_path
             log.info("Data path set to $PACEMAKERDATAPATH = {}".format(env_data_path))
-
-    # MPI: resolve the dataset path against the launch dir before any rank chdir's
-    if _MPI_ON and isinstance(data_config, dict):
-        _dp = data_config.get("datapath")
-        _fn = data_config.get("filename")
-        if _fn is not None and not os.path.isabs(_fn) and not (_dp and os.path.isabs(_dp)):
-            data_config["filename"] = os.path.join(_ORIG_CWD, _dp or "", _fn)
-            log.info("MPI: resolved dataset path -> {}".format(data_config["filename"]))
 
     # backend section
     backend_config = {}

@@ -86,6 +86,20 @@ PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 bash -c 'CUDA_VISIBLE_DEVICES=$SLURM
   the number of ranks).
 - Without `PACEMAKER_MPI=1` nothing changes: one process runs the upstream code.
 
+## BFGS: checkpoint and pause (PyTorch backend)
+
+```yaml
+fit:
+  bfgs_checkpoint: bfgs_ckpt.npz   # save the BFGS state (point, inverse Hessian, ...)
+  bfgs_checkpoint_every: 10        # iterations between saves
+```
+
+- BFGS runs natively: scipy's line search and stopping rules with an O(N^2) update instead of scipy's O(N^3).
+  `fit: options: {native_bfgs: false}` uses scipy's.
+- `PACE_DEADLINE` (unix time of the job's end) and `PACE_MARGIN` (seconds before it, default 240): the fit saves and
+  stops before the deadline and leaves `BFGS_PAUSED`. The next run with the same checkpoint continues with the saved
+  curvature, from the potential you give it (for example the last interim potential).
+
 ## Credits and licence
 
 pacemaker / python-ace and TensorPotential are by Yury Lysogorskiy, Anton Bochkarev, Ralf Drautz et al. (ICAMS,

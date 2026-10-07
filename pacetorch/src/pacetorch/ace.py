@@ -197,12 +197,15 @@ class ACE:
     # ------------------------------------------------------------------------------------------- batch indices
     def prepare_batch(self, b):
         """Host-side, once per batch: element of every atom, element-local atom index, per-bond-type pair lists."""
-        Z2e = {z: i for i, z in enumerate(self.elems_Z)}
+        lut = np.full(256, -1, dtype=np.int64)          # atomic number -> element index
+        lut[self.elems_Z] = np.arange(len(self.elems_Z))
         ind_i = np.asarray(b["ind_i"], dtype=np.int64)
         ind_j = np.asarray(b["ind_j"], dtype=np.int64)
         nat = len(b["positions"])
-        ei = np.vectorize(Z2e.__getitem__, otypes=[np.int64])(np.asarray(b["mu_i"]))
-        ej = np.vectorize(Z2e.__getitem__, otypes=[np.int64])(np.asarray(b["mu_j"]))
+        ei = lut[np.asarray(b["mu_i"], dtype=np.int64)]
+        ej = lut[np.asarray(b["mu_j"], dtype=np.int64)]
+        if (ei < 0).any() or (ej < 0).any():
+            raise ValueError("structure contains an element that is not in the potential")
         atom_e = np.full(nat, -1, dtype=np.int64)
         atom_e[ind_i] = ei
         if (atom_e < 0).any():
@@ -215,8 +218,12 @@ class ACE:
             atoms_e.append(a)
         pairs = []
         present = np.zeros((nat, len(self.bond_combs)), dtype=bool)
+        key = ei * self.nelements + ej
+        order = np.argsort(key, kind="stable")
+        bounds = np.searchsorted(key[order], np.arange(self.nelements ** 2 + 1))
         for ci, (e, mu) in enumerate(self.bond_combs):
-            p = np.nonzero((ei == e) & (ej == mu))[0]
+            k = e * self.nelements + mu
+            p = order[bounds[k]:bounds[k + 1]]
             pairs.append(dict(p=p, central=ind_i[p], central_local=local[ind_i[p]]))
             present[ind_i[p], ci] = True
         return dict(nat=nat, atoms_e=atoms_e, pairs=pairs, present=present)

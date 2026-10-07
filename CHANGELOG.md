@@ -52,3 +52,10 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
   through the backward pass) instead of reverse-over-reverse (the backward pass differentiated again); both exact.
 - Measured, one A100, batch 94: 21.45 s/eval and 30.87 GiB, against 13.73 s/eval and 32.39 GiB for
   reverse-over-reverse: 57% slower for 5% less memory (separate jobs). Undone in 6.
+
+### 5. Native BFGS: O(N^2) update, checkpoint, deadline pause (2026-10-06)
+
+- Problem: scipy's inverse-Hessian update is two dense N x N products (O(N^3)), and fits outlive a job.
+- Change: scipy's line search and stopping rules with the update multiplied out, O(N^2); `fit: bfgs_checkpoint`;
+  a pause before `PACE_DEADLINE`.
+- Effect: same iterates and statuses as scipy; checkpoint resume bit-identical; the update at N = 9640: 0.52 s.

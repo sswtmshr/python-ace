@@ -151,9 +151,16 @@ class FitTorchPotential:
             options["maxiter"] = niter
             log.info("Minimizer options: {}".format(options))
             self.fit_metrics_data_dict = {}
+            native = bool(options.pop("native_bfgs", True)) and optimizer == "BFGS"
             try:
-                res_opt = minimize(self.fit_func, coefs, method=optimizer, jac=True, args=(batches,),
-                                   options=options, callback=self.callback)
+                if native:   # O(N^2) update, optional checkpoint/pause (pyace.bfgs); same iterates as scipy BFGS
+                    from pyace.bfgs import minimize_bfgs
+                    res_opt = minimize_bfgs(self.fit_func, coefs, args=(batches,), callback=self.callback,
+                                            options=options, tag=self.tensorpot.loss_specs[LOSS_FORCE_FACTOR])
+                else:
+                    options.pop("checkpoint", None), options.pop("checkpoint_every", None)
+                    res_opt = minimize(self.fit_func, coefs, method=optimizer, jac=True, args=(batches,),
+                                       options=options, callback=self.callback)
             except StopIteration as e:   # pacemaker early stopping raised inside the callback
                 log.info("Optimization stopped by callback: {}".format(e))
                 res_opt = OptimizeResult(x=self._last_x.copy(), success=True, status=0, message=str(e),

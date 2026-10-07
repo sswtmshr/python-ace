@@ -1,5 +1,6 @@
 import logging
 import numpy as np
+from pyace import mpi as _mpi   # data-parallel runs: only rank 0 writes files (identity without MPI)
 import os
 from pyace.preparedata import E_CHULL_DIST_PER_ATOM
 
@@ -297,6 +298,8 @@ class MetricsAggregator:
             self.print_extended_metrics(metrics_dict, title='TEST STATS')
 
     def write_metric_table_title_to_file(self, filename="metrics.log", columns=None):
+        if not _mpi.is_root():
+            return
         if columns is None:
             columns = MetricsAggregator.columns
         fmt_content_list, fmt_string_list = self._prepare_fmt_string_content(columns)
@@ -321,6 +324,8 @@ class MetricsAggregator:
         return fmt_content_list, fmt_string_list
 
     def append_metric_line_to_file(self, fit_metrics_dict, filename="metrics.log", columns=None):
+        if not _mpi.is_root():
+            return
         if columns is None:
             columns = MetricsAggregator.columns
 

@@ -288,6 +288,11 @@ class FitBackendAdapter:
             batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
             attach_stress_weights(test_dataframe, float(getattr(loss_spec, "w_stress", 0) or 0))
             fit_options = fit_config.get(FIT_OPTIONS_KW, None)
+            if fit_config.get("bfgs_checkpoint"):
+                # fit: bfgs_checkpoint: <file.npz> -> save/resume the BFGS state (native BFGS); absent = no file
+                fit_options = dict(fit_options or {"gtol": 1e-8, "disp": True})
+                fit_options["checkpoint"] = str(fit_config["bfgs_checkpoint"])
+                fit_options["checkpoint_every"] = int(fit_config.get("bfgs_checkpoint_every", 10))
             self.fitter.fit(dataframe, test_df=test_dataframe, niter=fit_config[FIT_NITER_KW],
                             optimizer=fit_config[FIT_OPTIMIZER_KW],
                             batch_size=batch_size, jacobian_factor=jacobian_factor,

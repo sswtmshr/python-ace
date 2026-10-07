@@ -2,6 +2,7 @@ import logging
 from collections import defaultdict
 
 import numpy as np
+from pyace import mpi as _mpi   # data-parallel runs: only rank 0 writes files (identity without MPI)
 import os
 import pandas as pd
 import time
@@ -29,6 +30,8 @@ def sizeof_fmt(file_name_or_size, suffix='B'):
 
 
 def save_dataframe(df: pd.DataFrame, filename: str, protocol: int = 4):
+    if not _mpi.is_root():
+        return
     filename = os.path.abspath(filename)
     log.info("Writing fit pickle file: {}".format(filename))
     if filename.endswith("gzip"):
