@@ -99,22 +99,41 @@ def world_size():
     return c.Get_size() if c is not None else 1
 
 
+_local_rank_cache = None
+
+
 def local_rank():
-    """Node-local rank. Prefer SLURM_LOCALID; fall back to a shared-memory split."""
-    v = os.environ.get("SLURM_LOCALID")
-    if v is not None:
-        return int(v)
-    v = os.environ.get("MPI_LOCALRANKID") or os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK")
-    if v is not None:
-        return int(v)
+    """Node-local rank, from MPI itself (ranks sharing a node = shared-memory split of COMM_WORLD). Correct for any
+    launcher: srun, mpirun/mpiexec inside Slurm (where every rank inherits the batch step's SLURM_LOCALID=0),
+    PBS/PALS on Aurora/Polaris. Launcher environment variables are only a fallback when MPI is not active."""
+    global _local_rank_cache
+    if _local_rank_cache is not None:
+        return _local_rank_cache
+    c = _comm()
+    if c is not None:
+        MPI = _mpi()
+        node = c.Split_type(MPI.COMM_TYPE_SHARED, key=c.Get_rank())
+        _local_rank_cache = node.Get_rank()
+        node.Free()
+        return _local_rank_cache
+    for k in ("SLURM_LOCALID", "PALS_LOCAL_RANKID", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK"):
+        v = os.environ.get(k)
+        if v is not None:
+            return int(v)
+    return 0
+
+
+def node_allgather(obj):
+    """Gather a picklable object from every rank on this node (same shared-memory split as local_rank), in local-rank
+    order. [obj] without MPI. Collective: every rank must call it."""
     c = _comm()
     if c is None:
-        return 0
+        return [obj]
     MPI = _mpi()
     node = c.Split_type(MPI.COMM_TYPE_SHARED, key=c.Get_rank())
-    lr = node.Get_rank()
+    out = node.allgather(obj)
     node.Free()
-    return lr
+    return out
 
 
 def is_root():

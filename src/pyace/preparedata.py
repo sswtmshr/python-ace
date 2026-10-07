@@ -13,7 +13,8 @@ from ase.calculators.singlepoint import SinglePointCalculator
 
 from pyace.atomicenvironment import aseatoms_to_atomicenvironment, generate_tp_atoms
 from pyace.const import *
-from pyace.process_df import compute_convexhull_dist, compute_corrected_energy, SINGLE_ATOM_ENERGY_DICT, \
+from pyace.process_df import compute_convexhull_dist, compute_corrected_energy, compute_compositions, \
+    SINGLE_ATOM_ENERGY_DICT, \
     compute_shifted_scaled_corrected_energy
 
 log = logging.getLogger(__name__)
@@ -786,9 +787,11 @@ class ACEDataset:
                 log.info(f"Using {self.reference_energy} as single-atom energies")
                 compute_corrected_energy(df, esa_dict=self.reference_energy)
             elif isinstance(self.reference_energy, (float, int)):  # just copy energy to energy_corrected
-                log.info(f"Using constant reference energy {self.reference_energy}")
-                self.reference_energy = defaultdict(lambda: self.reference_energy)
-                compute_corrected_energy(df, esa_dict=self.reference_energy)
+                # same constant for every element (stock built a defaultdict whose factory returned the dict itself,
+                # and .get() bypassed it: the constant was silently replaced by 0)
+                e0 = float(self.reference_energy)
+                log.info(f"Using constant reference energy {e0} for every element")
+                compute_corrected_energy(df, esa_dict={el: e0 for el in compute_compositions(df)})
         elif ENERGY_CORRECTED_COL not in df.columns:
             raise ValueError(f"Neither '{ENERGY_CORRECTED_COL}' column nor 'data::reference_energy' option provided")
 

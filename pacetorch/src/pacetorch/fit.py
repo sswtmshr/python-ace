@@ -115,6 +115,9 @@ class FitTorchPotential:
         if test_metric_callback is not None:
             self.test_metric_callback = test_metric_callback
         self.batch_size = batch_size
+        if self._dist():   # collective, every rank is here: warn if the launcher put several ranks on one GPU
+            from pacetorch import check_shared_devices
+            check_shared_devices(self.tensorpot.device, mpi)
         self.data_df = df[df["tp_atoms"].notna()].reset_index(drop=True)
         t = time.time()
         np_batches = batching_data(self.data_df, batch_size=batch_size)

@@ -14,8 +14,10 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | 1 multinode (TensorFlow) | 2026-08-31 | | | 6.3 s/eval on 4 A100s |
 | 3 PyTorch backend | 2026-10-06 | 13.7* | 32.4 GiB* | 3.75 s/eval on 4 A100s |
 | 4 forward-over-reverse (trial) | 2026-10-06 | 21.45 | 30.87 GiB | |
+| 6 back to reverse-over-reverse, int32 indices | 2026-10-06 | | 30.75 GiB** | |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
+- \*\* measured after 7 and 8, which do not change memory (32.39 -> 30.75 GiB: the int32 index arrays).
 
 ### 1. Multi-GPU / multi-node fitting with MPI, TensorFlow backend (2026-08-31)
 
@@ -59,3 +61,12 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - Change: scipy's line search and stopping rules with the update multiplied out, O(N^2); `fit: bfgs_checkpoint`;
   a pause before `PACE_DEADLINE`.
 - Effect: same iterates and statuses as scipy; checkpoint resume bit-identical; the update at N = 9640: 0.52 s.
+
+### 6. Back to reverse-over-reverse; cell volume; int32 indices; GPU per rank from MPI (2026-10-06)
+
+- The forward-over-reverse gradient of 4 is removed.
+- Cell volume by triple product (`torch.linalg.det` failed on some GPUs).
+- int32 index arrays: half the neighbour-list memory, 32.39 -> 30.75 GiB.
+- Each rank picks its GPU itself, from its MPI node-local rank (any launcher, no pinning in the launch line), with a
+  warning when two ranks share a GPU.
+- Bug fix: a numeric `data: reference_energy` was silently replaced by 0.
