@@ -37,6 +37,22 @@ class BackendConfig:
         return self.backend_config_dict.get(item, default_value)
 
 
+def attach_stress_weights(df, w_stress):
+    """w_stress > 0: per-structure stress-loss weight column `w_stress` = 1/N over the fully periodic structures
+    with a finite 6- or 9-component `stress` label (ASE convention, eV/A^3), 0 elsewhere; batching_data then
+    copies label and weight into tp_atoms. w_stress = 0: nothing (stress not fitted)."""
+    if df is None or not w_stress:
+        return
+    if "stress" not in df.columns:
+        raise ValueError("fit: loss: w_stress > 0 needs a `stress` column (ASE Voigt, eV/A^3) in the dataset")
+    ok = df["stress"].map(lambda s: s is not None and np.size(s) in (6, 9) and bool(np.all(np.isfinite(s))))
+    if "ase_atoms" in df.columns:
+        ok &= df["ase_atoms"].map(lambda a: bool(np.all(a.get_pbc())))
+    n = int(ok.sum())
+    df["w_stress"] = ok.astype(np.float64) / max(n, 1)
+    log.info("Stress fit: w_stress = {}, {} of {} structures with a stress label".format(w_stress, n, len(df)))
+
+
 class FitBackendAdapter:
 
     def __init__(self, backend_config: Union[Dict, BackendConfig], loss_spec: LossFunctionSpecification = None,
@@ -173,7 +189,7 @@ class FitBackendAdapter:
         from tensorpotential.fit import FitTensorPotential
         from tensorpotential.utils.utilities import batching_data, init_gpu_config
         from tensorpotential.constants import (LOSS_TYPE, LOSS_FORCE_FACTOR, LOSS_ENERGY_FACTOR, L1_REG,
-                                               L2_REG, AUX_LOSS_FACTOR)
+                                               L2_REG, AUX_LOSS_FACTOR, LOSS_STRESS_FACTOR)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -182,6 +198,8 @@ class FitBackendAdapter:
             batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
             log.info("Loss function specification: " + str(loss_spec))
             log.info("Batch size: {}".format(batch_size))
+            w_stress = float(getattr(loss_spec, "w_stress", 0) or 0)
+            attach_stress_weights(dataframe, w_stress)
             batches = batching_data(dataframe, batch_size=batch_size)
             n_batches = len(batches)
             loss_force_factor = loss_spec.kappa
@@ -203,6 +221,8 @@ class FitBackendAdapter:
             }
             if aux_loss_factor:
                 loss_specs[AUX_LOSS_FACTOR] = aux_loss_factor
+            if w_stress > 0:
+                loss_specs[LOSS_STRESS_FACTOR] = np.float64(w_stress)
 
             ace_potential = ACE(bbasisconfig, compute_orthogonality=has_orthogonality,
                                 compute_smoothness=has_smoothness)
@@ -232,6 +252,7 @@ class FitBackendAdapter:
             else:
                 jacobian_factor = jacobian_factor.astype(float)
             batch_size = self.backend_config.get(BACKEND_BATCH_SIZE_KW, 10)
+            attach_stress_weights(test_dataframe, float(getattr(loss_spec, "w_stress", 0) or 0))
             fit_options = fit_config.get(FIT_OPTIONS_KW, None)
             self.fitter.fit(dataframe, test_df=test_dataframe, niter=fit_config[FIT_NITER_KW],
                             optimizer=fit_config[FIT_OPTIMIZER_KW],

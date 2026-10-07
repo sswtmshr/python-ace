@@ -13,6 +13,24 @@ class FitMetrics:
 
         self.loss = 0
         self.eval_time = 0
+        # stress term (0 / absent when stress is not fitted)
+        self.s_scale = 0.
+        self.s_loss = 0.
+        self.rmse_s = 0.
+        self.mae_s = 0.
+        self.max_abs_s = 0.
+
+    def compute_stress_metrics(self, ds, sw):
+        """ds: (n_struct, 6) Voigt residuals in eV/A^3, sw: (n_struct, 1) loss weights; metrics in GPa over the
+        structures with a stress label (sw > 0)"""
+        gpa = 160.21766208
+        self.s_loss = float(np.sum(sw * ds ** 2))
+        m = sw.reshape(-1) > 0
+        if m.any():
+            d = ds[m] * gpa
+            self.rmse_s = float(np.sqrt(np.mean(d ** 2)))
+            self.mae_s = float(np.mean(np.abs(d)))
+            self.max_abs_s = float(np.max(np.abs(d)))
 
     def record_time(self, time):
         self.time_history.append(time)
@@ -34,6 +52,12 @@ class FitMetrics:
             # loss contributions
             "e_loss_contrib": self.e_loss * self.e_scale,
             "f_loss_contrib": self.f_loss * self.f_scale,
+            "s_loss_contrib": self.s_loss * self.s_scale,
+            "s_loss": self.s_loss,
+            "s_scale": self.s_scale,
+            "rmse_s": self.rmse_s,
+            "mae_s": self.mae_s,
+            "max_abs_s": self.max_abs_s,
             "l1_reg_contrib": l1,
             "l2_reg_contrib": l2,
             "extra_regularization_contrib": smoothness_reg_loss,
@@ -87,6 +111,11 @@ class FitMetrics:
 
         self.e_scale = fit_metrics_dict["e_scale"]
         self.f_scale = fit_metrics_dict["f_scale"]
+        self.s_loss = fit_metrics_dict.get("s_loss", 0.)
+        self.s_scale = fit_metrics_dict.get("s_scale", 0.)
+        self.rmse_s = fit_metrics_dict.get("rmse_s", 0.)
+        self.mae_s = fit_metrics_dict.get("mae_s", 0.)
+        self.max_abs_s = fit_metrics_dict.get("max_abs_s", 0.)
 
         # RMSE metrics
         self.rmse_epa = fit_metrics_dict["rmse_epa"]

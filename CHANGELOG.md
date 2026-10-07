@@ -23,3 +23,9 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - `backend: gpu_config: {memory_growth: true}`; fixes under MPI: early stopping deadlocked the other ranks, a missing
   metrics default crashed, `predict()` ran out of memory at the full batch size.
 - Measured: 4 A100s 6.3 s/eval (one A100: 20.0).
+
+### 2. Stress in the loss (2026-10-06)
+
+- `fit: loss: w_stress` compares the 6 Voigt components (eV/A^3, ASE sign) of sigma = sym(h^T dE/dh)/V at fixed
+  fractional coordinates, in one tape pass; weights uniform over the periodic structures with a stress label.
+- Cost: +1-3% time. With `w_stress: 0` the behaviour is upstream's.

@@ -43,6 +43,25 @@ def _combine_error_lists(de, de_pa, df, total_na):
     return de, de_pa, df, total_na
 
 
+EV_A3_TO_GPA = 160.21766208
+
+
+def stress_errors(b, s_pred):
+    """per-structure stress residuals (pred - ref, 6 Voigt xx yy zz yz xz xy, eV/A^3) and loss weights of batch b"""
+    ds = np.asarray(s_pred).reshape(-1, 3, 3) - b['stress'].reshape(-1, 3, 3)
+    ds_v = np.stack([ds[:, 0, 0], ds[:, 1, 1], ds[:, 2, 2], ds[:, 1, 2], ds[:, 0, 2], ds[:, 0, 1]], axis=1)
+    return ds_v, b['sweights'].reshape(-1, 1)
+
+
+def _combine_stress_lists(ds, sw):
+    ds = np.vstack(ds) if ds else np.zeros((0, 6))
+    sw = np.vstack(sw) if sw else np.zeros((0, 1))
+    if mpi.is_distributed():
+        ds = mpi.allgather_vstack(ds)
+        sw = mpi.allgather_vstack(sw)
+    return ds, sw
+
+
 def _my_struct_range(n_struct):
     """This rank's contiguous [lo, hi) slice of range(n_struct). Empty slice -> lo==hi."""
     w = mpi.world_size()
@@ -84,6 +103,8 @@ def slice_batch_structs(b, s_lo, s_hi):
         'energy':    b['energy'][s_lo:s_hi],
         'eweights':  b['eweights'][s_lo:s_hi],
         'cell':      b['cell'][s_lo:s_hi],
+        'stress':    b['stress'][s_lo:s_hi],
+        'sweights':  b['sweights'][s_lo:s_hi],
         # per-pair (neighbour list); pairs are intra-structure so ind_* stay in-range
         'ind_i':     b['ind_i'][p_lo:p_hi] - a_lo,
         'ind_j':     b['ind_j'][p_lo:p_hi] - a_lo,
@@ -187,6 +208,7 @@ class FitTensorPotential:
         force_scale = float(self.tensorpot.loss_specs[LOSS_FORCE_FACTOR])
         energy_scale = float(self.tensorpot.loss_specs[LOSS_ENERGY_FACTOR])
         self.metrics = FitMetrics(w_e, w_f, energy_scale, force_scale, self.ncoefs)
+        self.metrics.s_scale = float(self.tensorpot.loss_specs.get(LOSS_STRESS_FACTOR, 0.))
         self.metrics.nfuncs = self.nfuncs
 
         if test_df is not None:
@@ -341,6 +363,8 @@ class FitTensorPotential:
         tot_jac = 0
         de, de_pa, df = ([] for _ in range(3))
         total_na = []
+        ds_l, sw_l = [], []
+        fit_stress = self.tensorpot.fit_stress
         t0 = time.time()
         if not mpi.is_distributed():
             # single process: behave exactly like stock (let any error propagate
@@ -350,6 +374,10 @@ class FitTensorPotential:
                 tot_jac += jac.numpy()
                 tot_loss += loss.numpy()
                 errors = self.compute_batch_errors(b, e.numpy(), f.numpy())
+                if fit_stress:
+                    _ds, _sw = stress_errors(b, self.tensorpot.last_stress.numpy())
+                    ds_l.append(_ds)
+                    sw_l.append(_sw)
                 de.append(errors[0])
                 de_pa.append(errors[1])
                 df.append(errors[2])
@@ -373,6 +401,10 @@ class FitTensorPotential:
                     tot_jac = tot_jac + jac.numpy()
                     tot_loss += float(loss.numpy())
                     errors = self.compute_batch_errors(sb, e.numpy(), f.numpy())
+                    if fit_stress:
+                        _ds, _sw = stress_errors(sb, self.tensorpot.last_stress.numpy())
+                        ds_l.append(_ds)
+                        sw_l.append(_sw)
                     de.append(errors[0])
                     de_pa.append(errors[1])
                     df.append(errors[2])
@@ -407,6 +439,8 @@ class FitTensorPotential:
         # stay exact; skip only the "low" sub-metrics by passing dataframe=None.
         _df_for_metrics = None if getattr(self, '_inbatch', False) else self.data_df
         self.metrics.compute_metrics(g_de, g_de_pa, g_df, g_na, dataframe=_df_for_metrics)
+        if fit_stress:
+            self.metrics.compute_stress_metrics(*_combine_stress_lists(ds_l, sw_l))
         self.metrics.loss = tot_loss
         self.metrics.eval_time = self.eval_time
         # do a snapshot of  FitMetrics into FitMetricsData: loss, e_loss, f_loss, reg_loss, RMSE, MAE, MAX_E (E,F), timing

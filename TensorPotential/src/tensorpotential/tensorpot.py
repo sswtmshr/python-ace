@@ -22,7 +22,11 @@ class TensorPotential(tf.Module):
         self.reg_components = []
 
         self.list_of_int_placeholders = ['ind_i', 'ind_j', 'mu_i', 'mu_j', 'pair_map', 'cell_map', 'e_map']
-        self.list_of_float_placeholders = ['positions', 'offsets', 'cell', 'energy', 'forces', 'eweights', 'fweights']
+        self.list_of_float_placeholders = ['positions', 'offsets', 'cell', 'energy', 'forces', 'eweights', 'fweights',
+                                           'stress', 'sweights']
+        # stress term (GRACE-style): on only when its factor is > 0, so w_stress = 0 runs the original graph
+        self.fit_stress = float(self.loss_specs.get(LOSS_STRESS_FACTOR, 0.)) > 0
+        self.last_stress = None
 
         if isinstance(jit_op_compile, list):
             self.compute_loss_compile = jit_op_compile[0]
@@ -59,14 +63,15 @@ class TensorPotential(tf.Module):
             LOSS_ENERGY_FACTOR: tf.constant(specs.get(LOSS_ENERGY_FACTOR, 1.), tf.float64),
             L1_REG: tf.constant(specs.get(L1_REG, 0.), tf.float64),
             L2_REG: tf.constant(specs.get(L2_REG, 0.), tf.float64),
-            AUX_LOSS_FACTOR: tf.constant(specs.get(AUX_LOSS_FACTOR, [0.]), tf.float64)
+            AUX_LOSS_FACTOR: tf.constant(specs.get(AUX_LOSS_FACTOR, [0.]), tf.float64),
+            LOSS_STRESS_FACTOR: tf.constant(specs.get(LOSS_STRESS_FACTOR, 0.), tf.float64)
         }
 
         return spec_dict
 
     def init_placeholders(self, **kwargs):
         self.__dict__.update((k, tf.convert_to_tensor(v, dtype=tf.float64)) for k, v in kwargs.items() if
-                             k in self.list_of_float_placeholders)
+                             k in self.list_of_float_placeholders and v is not None)
         self.__dict__.update((k, tf.convert_to_tensor(v, dtype=tf.int32)) for k, v in kwargs.items() if
                              k in self.list_of_int_placeholders)
 
@@ -165,31 +170,35 @@ class TensorPotential(tf.Module):
                                               tf.TensorSpec([None], tf.int32),
                                               tf.TensorSpec([None], tf.int32),
                                               tf.TensorSpec([None], tf.int32),
-                                              tf.TensorSpec([None], tf.int32)
+                                              tf.TensorSpec([None], tf.int32),
+                                              tf.TensorSpec([None, 3, 3], tf.float64),
+                                              tf.TensorSpec([None, 1], tf.float64)
                                           ],
                                           jit_compile=self.compute_loss_compile
                                           )
 
     def _evaluate_loss(self, positions, offsets, cell, energy, forces, eweights, fweights,
-                        ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map):
+                        ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map, stress=None, sweights=None):
 
         self.init_placeholders(positions=positions, offsets=offsets, cell=cell, energy=energy, forces=forces,
                                eweights=eweights, fweights=fweights, ind_i=ind_i, ind_j=ind_j,
-                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map)
+                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map,
+                               stress=stress, sweights=sweights)
         if self.op_compile:
             with tf.xla.experimental.jit_scope():
-                loss, grad_loss, e, f = self.compute_grad()
+                loss, grad_loss, e, f, s = self.compute_grad()
         else:
-            loss, grad_loss, e, f = self.compute_grad()
+            loss, grad_loss, e, f, s = self.compute_grad()
 
-        return loss, grad_loss, e, f, self.reg_components
+        return loss, grad_loss, e, f, self.reg_components, s
 
     def _evaluate_vector_loss(self, positions, offsets, cell, energy, forces, eweights, fweights,
-                            ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map):
+                            ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map, stress=None, sweights=None):
 
         self.init_placeholders(positions=positions, offsets=offsets, cell=cell, energy=energy, forces=forces,
                                eweights=eweights, fweights=fweights, ind_i=ind_i, ind_j=ind_j,
-                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map)
+                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map,
+                               stress=stress, sweights=sweights)
         loss, grad_loss, e, f = self.compute_vector_grad()
 
         return loss, grad_loss, e, f, self.reg_components
@@ -210,18 +219,21 @@ class TensorPotential(tf.Module):
                                                      tf.TensorSpec([None], tf.int32),
                                                      tf.TensorSpec([None], tf.int32),
                                                      tf.TensorSpec([None], tf.int32),
-                                                     tf.TensorSpec([None], tf.int32)
+                                                     tf.TensorSpec([None], tf.int32),
+                                                     tf.TensorSpec([None, 3, 3], tf.float64),
+                                                     tf.TensorSpec([None, 1], tf.float64)
                                                  ])
 
     def _eager_evaluate_loss(self, positions, offsets, cell, energy, forces, eweights, fweights,
-                        ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map):
+                        ind_i, ind_j, mu_i, mu_j, pair_map, cell_map, e_map, stress=None, sweights=None):
 
         self.init_placeholders(positions=positions, offsets=offsets, cell=cell, energy=energy, forces=forces,
                                eweights=eweights, fweights=fweights, ind_i=ind_i, ind_j=ind_j,
-                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map)
-        loss, grad_loss, e, f = self.compute_grad()
+                               mu_i=mu_i, mu_j=mu_j, pair_map=pair_map, cell_map=cell_map, e_map=e_map,
+                               stress=stress, sweights=sweights)
+        loss, grad_loss, e, f, s = self.compute_grad()
 
-        return loss, grad_loss, e, f, self.reg_components
+        return loss, grad_loss, e, f, self.reg_components, s
 
     def compute_positions(self):
         cells_pos = tf.gather(self.cell, self.cell_map)
@@ -276,7 +288,19 @@ class TensorPotential(tf.Module):
 
         return tf.concat(total_residuals, axis=0)
 
-    def compute_loss(self, e, f):
+    def compute_virial_stress(self, dedh):
+        """stress (ASE convention, eV/A^3) from dE/dcell at fixed fractional coordinates:
+        sigma = h^T dE/dh / V, symmetrised (rows of h = lattice vectors, r = s h)"""
+        vol = tf.reshape(tf.abs(tf.linalg.det(self.cell)), [-1, 1, 1])
+        sig = tf.matmul(self.cell, dedh, transpose_a=True) / vol
+        return 0.5 * (sig + tf.transpose(sig, [0, 2, 1]))
+
+    def compute_stress_loss(self, sig):
+        ds = sig - self.stress
+        ds_v = tf.stack([ds[:, 0, 0], ds[:, 1, 1], ds[:, 2, 2], ds[:, 1, 2], ds[:, 0, 2], ds[:, 0, 1]], axis=1)
+        return self.loss_specs[LOSS_STRESS_FACTOR] * tf.reduce_sum(self.sweights * ds_v ** 2)
+
+    def compute_loss(self, e, f, sig=None):
         total_loss = 0
         if self.loss_specs[LOSS_TYPE] == 'per-structure':
             total_loss += self.loss_specs[LOSS_ENERGY_FACTOR] * tf.reduce_sum(self.eweights * (e - self.energy) ** 2)
@@ -289,6 +313,8 @@ class TensorPotential(tf.Module):
 
         loss_f = tf.reduce_sum(self.fweights * (f - self.forces)**2)
         total_loss += self.loss_specs[LOSS_FORCE_FACTOR] * loss_f
+        if sig is not None:
+            total_loss += self.compute_stress_loss(sig)
 
         reg_components = []
         self.potential.compute_regularization()
@@ -304,6 +330,8 @@ class TensorPotential(tf.Module):
         return total_loss
 
     def compute_grad(self):
+        if self.fit_stress:
+            return self.compute_grad_stress()
         pos = self.compute_positions()
         self.fit_coefs = self.potential.fit_coefs
         with tf.GradientTape(persistent=True) as tape:
@@ -315,9 +343,28 @@ class TensorPotential(tf.Module):
 
         f = tf.convert_to_tensor(f)
 
-        return loss, grad_loss, e, f
+        return loss, grad_loss, e, f, tf.zeros_like(self.cell)
+
+    def compute_grad_stress(self):
+        # positions built inside the tape from the watched cell: dE/dcell is then the full derivative at fixed
+        # fractional coordinates (through the atom positions and the image offsets), dE/dpos still the forces
+        self.fit_coefs = self.potential.fit_coefs
+        with tf.GradientTape(persistent=True) as tape:
+            tape.watch(self.cell)
+            pos = self.compute_positions()
+            tape.watch(pos)
+            e = self.forward_pass(pos)
+            f, dedh = tape.gradient(e, [pos, self.cell])
+            f = tf.negative(f)
+            sig = self.compute_virial_stress(dedh)
+            loss = self.compute_loss(e, f, sig)
+        grad_loss = tape.gradient(loss, self.fit_coefs)
+
+        return loss, grad_loss, e, tf.convert_to_tensor(f), sig
 
     def compute_vector_grad(self):
+        if self.fit_stress:
+            raise NotImplementedError('stress loss is implemented for the scalar loss (BFGS / L-BFGS-B / CG / Adam) only')
         pos = self.compute_positions()
         self.fit_coefs = self.potential.fit_coefs
         with tf.GradientTape(persistent=True) as tape:
@@ -332,10 +379,11 @@ class TensorPotential(tf.Module):
         return loss, grad_loss, e, f
 
     def compute_energy_forces_stress(self):
-        pos = self.compute_positions()
+        # dE/dcell at fixed fractional coordinates (positions built inside the tape); stress = h^T dE/dh / V
         with tf.GradientTape(persistent=True) as tape:
-            tape.watch(pos)
             tape.watch(self.cell)
+            pos = self.compute_positions()
+            tape.watch(pos)
             e = self.forward_pass(pos)
         f = tape.gradient(e, pos)
         f = tf.negative(tf.convert_to_tensor(f))
@@ -372,17 +420,17 @@ class TensorPotential(tf.Module):
     def external_fit(self, coefs, data, eager=False):
         self.potential.set_coefs(coefs)
         if eager:
-            loss, grad_loss, e, f, self.reg_components = self._eager_evaluate_loss(*input2evaloss(data))
+            loss, grad_loss, e, f, self.reg_components, self.last_stress = self._eager_evaluate_loss(*input2evaloss(data))
         else:
-            loss, grad_loss, e, f, self.reg_components = self._evaluate_loss(*input2evaloss(data))
+            loss, grad_loss, e, f, self.reg_components, self.last_stress = self._evaluate_loss(*input2evaloss(data))
 
         return loss, grad_loss, e, f
 
     def native_fit(self, data, eager=False):
         if eager:
-            loss, grad_loss, e, f, self.reg_components = self._eager_evaluate_loss(*input2evaloss(data))
+            loss, grad_loss, e, f, self.reg_components, self.last_stress = self._eager_evaluate_loss(*input2evaloss(data))
         else:
-            loss, grad_loss, e, f, self.reg_components = self._evaluate_loss(*input2evaloss(data))
+            loss, grad_loss, e, f, self.reg_components, self.last_stress = self._evaluate_loss(*input2evaloss(data))
 
         return loss, grad_loss, e, f
 
@@ -417,11 +465,11 @@ class TensorPotential(tf.Module):
         return e, f, s
 
     def evaluate_loss(self, data):
-        loss, grad_loss, e, f, self.reg_components = self._evaluate_loss(*input2evaloss(data))
+        loss, grad_loss, e, f, self.reg_components, self.last_stress = self._evaluate_loss(*input2evaloss(data))
 
         return loss, grad_loss, e, f
 
     def eager_evaluate_loss(self, data):
-        loss, grad_loss, e, f, self.reg_components = self._eager_evaluate_loss(*input2evaloss(data))
+        loss, grad_loss, e, f, self.reg_components, self.last_stress = self._eager_evaluate_loss(*input2evaloss(data))
 
         return loss, grad_loss, e, f

@@ -186,7 +186,8 @@ class MetricsAggregator:
                "mae_f_comp", "low_mae_f_comp",
                ("nfuncs", 6), ("ncoefs", 6),  # reduce columns width
                "l1_reg_contrib", "l2_reg_contrib",
-               "smooth_orth", "smooth_w1", "smooth_w2", "smooth_w3"
+               "smooth_orth", "smooth_w1", "smooth_w2", "smooth_w3",
+               "s_loss_contrib", "rmse_s"   # stress term (0 when stress is not fitted); rmse_s in GPa
                ]
 
     def __init__(self, extended_display_step=20,
@@ -376,6 +377,13 @@ class MetricsAggregator:
                                                                   f_loss=fit_metrics_dict["f_loss_contrib"],
                                                                   fr=fr)
         str3 += '\n'
+        if fit_metrics_dict.get("s_scale", 0):
+            fr = fit_metrics_dict["s_loss_contrib"] / total_loss * 100 if total_loss > 0 else 0
+            str3 += '{prefix:>33} {s_loss:>1.4e} ({fr:3.0f}%) '.format(prefix='Stress: ',
+                                                                       s_loss=fit_metrics_dict["s_loss_contrib"],
+                                                                       fr=fr)
+            str3 += '  RMSE {:.2f} GPa  MAE {:.2f} GPa  MAX {:.2f} GPa\n'.format(
+                fit_metrics_dict["rmse_s"], fit_metrics_dict["mae_s"], fit_metrics_dict["max_abs_s"])
 
         l1 = fit_metrics_dict["l1_reg_contrib"]
         l2 = fit_metrics_dict["l2_reg_contrib"]
@@ -456,4 +464,6 @@ class MetricsAggregator:
                  .format(str3=" | Forces(low): ",
                          rmse_f_comp=1e3 * fit_metrics_dict["rmse_f_comp"],
                          low_rmse_f_comp=1e3 * fit_metrics_dict["low_rmse_f_comp"]) +
+                 (' | Stress: {:.2f} GPa'.format(fit_metrics_dict["rmse_s"]) if fit_metrics_dict.get("s_scale", 0)
+                  else '') +
                  ' | Time/eval: {:>6.2f} mcs/at'.format(avg_t * 1e6))

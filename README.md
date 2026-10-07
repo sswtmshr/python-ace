@@ -16,6 +16,19 @@ pip install ./TensorPotential       # the TensorFlow backend
 
 **Updating:** `git pull`, then `pip install .` and `pip install ./TensorPotential` again.
 
+## Stress in the loss
+
+```yaml
+fit:
+  loss: { kappa: 0.3, L1_coeffs: 1e-8, L2_coeffs: 1e-8, w_stress: 1.0 }
+```
+
+- `w_stress` > 0 adds the stress residual (6 Voigt components) to the loss; 0 or absent: upstream behaviour.
+- The dataset needs a `stress` column: 3x3 or 6 Voigt components per structure, eV/A^3, ASE sign convention.
+- Only fully periodic structures with a finite stress label count; their weights are uniform.
+- Stress errors are printed and written with the energy and force metrics.
+- An unknown key in `fit: loss:` is an error, so a typo cannot silently do nothing.
+
 ## Multi-GPU / multi-node fitting
 
 ```bash

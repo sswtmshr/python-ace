@@ -25,12 +25,31 @@ def apply_weights(row, fname='w_forces', ename='w_energy'):
     row['tp_atoms']['_fweights'] = np.array(row[fname]).reshape(-1, 1)
 
 
+def voigt_to_tensor(s):
+    """ASE stress (6 Voigt xx yy zz yz xz xy, or 3x3) -> (1, 3, 3)"""
+    s = np.asarray(s, dtype=np.float64).reshape(-1)
+    if s.size == 9:
+        return s.reshape(1, 3, 3)
+    xx, yy, zz, yz, xz, xy = s
+    return np.array([[[xx, xy, xz], [xy, yy, yz], [xz, yz, zz]]])
+
+
+def apply_stress(row, sname='stress', wname='w_stress'):
+    """stress label (eV/A^3, ASE sign) and its per-structure loss weight into tp_atoms"""
+    w = float(row[wname])
+    row['tp_atoms']['_sweights'] = np.array([[w]])
+    row['tp_atoms']['_stress'] = voigt_to_tensor(row[sname]) if w > 0 else np.zeros((1, 3, 3))
+
+
 def batching_data(df, batch_size=10):
     df.dropna(subset=['tp_atoms'], inplace=True)
     try:
         df.apply(apply_weights, axis=1)
     except:
         pass
+    if 'w_stress' in df.columns:
+        # not inside the try above: a failure here must not silently drop the stress term
+        df.apply(apply_stress, axis=1)
     df.index = np.arange(len(df))
     batch_index = chunks(len(df), batch_size)
     batches = []
@@ -47,6 +66,13 @@ def check_or_put_unit_weights(dic):
 
     if '_fweights' not in list(dic):
         dic.update({'_fweights': np.ones([len(dic['_forces']), 1])})
+
+    # no stress label / stress not fitted: zero weight (the stress loss term then vanishes)
+    if '_sweights' not in list(dic):
+        dic.update({'_sweights': np.zeros([1, 1])})
+
+    if '_stress' not in list(dic):
+        dic.update({'_stress': np.zeros([1, 3, 3])})
 
     return dic
 
@@ -69,6 +95,8 @@ def supply_batch(data):
         'positions': [],
         'eweights': [],
         'fweights': [],
+        'stress': [],
+        'sweights': [],
         'cell': [],
         'cell_map': [],
         'pair_map': [],
@@ -91,6 +119,8 @@ def supply_batch(data):
         batch_data['forces'].append(entry['_forces'])
         batch_data['eweights'].append(entry['_eweights'])
         batch_data['fweights'].append(entry['_fweights'])
+        batch_data['stress'].append(entry['_stress'])
+        batch_data['sweights'].append(entry['_sweights'])
         batch_data['positions'].append(entry['_positions'])
         batch_data['cell'].append(entry['_cell'])
         batch_data['pair_map'].append([count_cells] * n_pairs)
@@ -219,7 +249,9 @@ def input2evaloss(df):
            tf.convert_to_tensor(df['mu_j'], dtype=tf.int32, name='mu_j'),\
            tf.convert_to_tensor(df['pair_map'], dtype=tf.int32, name='pair_map'), \
            tf.convert_to_tensor(df['cell_map'], dtype=tf.int32, name='cell_map'),\
-           tf.convert_to_tensor(df['e_map'], dtype=tf.int32, name='e_map')
+           tf.convert_to_tensor(df['e_map'], dtype=tf.int32, name='e_map'),\
+           tf.convert_to_tensor(df['stress'], dtype=tf.float64, name='stress'),\
+           tf.convert_to_tensor(df['sweights'], dtype=tf.float64, name='sweights')
 
 
 
