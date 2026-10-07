@@ -16,7 +16,14 @@ from itertools import combinations_with_replacement
 import numpy as np
 import torch
 
+import os
+
 from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding, radial_function
+
+# A-basis construction: "dense" (batched matmul over padded neighbours) or "scatter" (per-pair products + index_add)
+_DENSE_A = os.environ.get("PACETORCH_ABASIS", "scatter") == "dense"
+# product basis: "complex" (complex128 tensors) or "real" (separate real/imaginary parts)
+_COMPLEX_PROD = os.environ.get("PACETORCH_PRODUCTS", "real") == "complex"   # default flips after validation
 
 _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12,
       'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23,
@@ -143,6 +150,7 @@ class ACE:
             nl_idx = [n * (bs.lmax + 1) + l for (n, l, lm) in ch]
             lm_idx = [lm for (n, l, lm) in ch]
             lmax_used = max([l for (n, l, lm) in ch], default=0)
+            nlm_idx = [n * (lmax_used + 1) ** 2 + lm for (n, l, lm) in ch]   # into the dense [n, (L+1)^2] A block
             self.bonds.append(dict(
                 c=c, nradmax=bs.nradmax, lmax=bs.lmax, nradbase=bs.nradbasemax, rcut=float(bs.rcut),
                 radbase=bs.radbasename, lmbda=float(bs.radparameters[0]),
@@ -151,7 +159,8 @@ class ACE:
                 crad=self.bond_to_slice[c], nd=self.embed_spec[e].ndensity,
                 r1_idx=torch.tensor(coefs_r1[c], dtype=torch.long),
                 nl_idx=torch.tensor(nl_idx, dtype=torch.long), lm_idx=torch.tensor(lm_idx, dtype=torch.long),
-                sh=SphericalHarmonics(lmax_used) if ch else None, has_A=bool(ch)))
+                sh=SphericalHarmonics(lmax_used) if ch else None, has_A=bool(ch),
+                L=lmax_used, nlm_idx=torch.tensor(nlm_idx, dtype=torch.long)))
 
         self.coefs = torch.tensor(coefs, dtype=torch.float64)
         self.to(device)
@@ -168,7 +177,7 @@ class ACE:
                 R["idx"] = [mv(i) for i in R["idx"]]
                 R["gcg"], R["msum"] = mv(R["gcg"]), mv(R["msum"])
         for B in self.bonds:
-            for k in ("r1_idx", "nl_idx", "lm_idx"):
+            for k in ("r1_idx", "nl_idx", "lm_idx", "nlm_idx"):
                 B[k] = mv(B[k])
         self.coefs = self.coefs.to(self.device)
         return self
@@ -224,7 +233,15 @@ class ACE:
         for ci, (e, mu) in enumerate(self.bond_combs):
             k = e * self.nelements + mu
             p = order[bounds[k]:bounds[k + 1]]
-            pairs.append(dict(p=p, central=ind_i[p], central_local=local[ind_i[p]]))
+            cl = local[ind_i[p]]
+            # dense layout: pair -> (central atom, slot); slot = rank of the pair among its atom's pairs of this type
+            o = np.argsort(cl, kind="stable")
+            cnt = np.bincount(cl, minlength=len(atoms_e[e]))
+            start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+            slot = np.empty(len(p), dtype=np.int64)
+            slot[o] = np.arange(len(p)) - start[cl[o]]
+            kmax = int(cnt.max()) if len(p) else 0
+            pairs.append(dict(p=p, central=ind_i[p], central_local=cl, kmax=kmax, dense=cl * kmax + slot))
             present[ind_i[p], ci] = True
         return dict(nat=nat, atoms_e=atoms_e, pairs=pairs, present=present)
 
@@ -289,7 +306,27 @@ class ACE:
                     r1 = torch.nn.functional.pad(r1, (0, nd_max - B["nd"]))
                 rho1[e] = rho1[e] + r1
             # A_{mu n l m}: R_nl(r) Y_lm(rhat), only the used channels
-            if B["has_A"]:
+            if B["has_A"] and _DENSE_A:
+                # A_{n,lm} = sum_j R_nl(r_j) Y_lm(rhat_j) as one batched matmul per l over a padded
+                # [atom, slot] neighbour layout: no per-pair [P, channels] products, no scatter
+                crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
+                L, nr = B["L"], B["nradmax"]
+                Rp = torch.einsum("pk,nlk->pnl", g, crad[:, :L + 1])                      # [P, nr, L+1]
+                yr, yi = B["sh"].compute(rij / d.unsqueeze(1))                            # [P, (L+1)^2]
+                ne_, K = len(idx["atoms_e_cpu"][e]), P["kmax"]
+                Rd = Rp.new_zeros(ne_ * K, nr, L + 1).index_copy(0, P["dense"], Rp).view(ne_, K, nr, L + 1)
+                Y = torch.cat([yr, yi], 1)
+                Yd = Y.new_zeros(ne_ * K, Y.shape[1]).index_copy(0, P["dense"], Y).view(ne_, K, -1)
+                nlm = (L + 1) ** 2
+                ar, ai = [], []
+                for l in range(L + 1):
+                    Yl = torch.cat([Yd[:, :, l * l:(l + 1) ** 2], Yd[:, :, nlm + l * l:nlm + (l + 1) ** 2]], 2)
+                    Al = torch.bmm(Rd[:, :, :, l].transpose(1, 2), Yl)                    # [ne, nr, 2(2l+1)]
+                    ar.append(Al[:, :, :2 * l + 1])
+                    ai.append(Al[:, :, 2 * l + 1:])
+                blk_r[e][mu] = torch.cat(ar, 2).reshape(ne_, -1).index_select(1, B["nlm_idx"])
+                blk_i[e][mu] = torch.cat(ai, 2).reshape(ne_, -1).index_select(1, B["nlm_idx"])
+            elif B["has_A"]:
                 crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
                 R = torch.einsum("pk,nlk->pnl", g, crad).reshape(len(d), -1).index_select(1, B["nl_idx"])
                 yr, yi = B["sh"].compute(rij / d.unsqueeze(1))
@@ -313,7 +350,17 @@ class ACE:
                 Ar = torch.cat([blk_r[e].get(mu, None) if mu in blk_r[e] else z(mu) for mu in sorted(E["chan"])], 1)
                 Ai = torch.cat([blk_i[e].get(mu, None) if mu in blk_i[e] else z(mu) for mu in sorted(E["chan"])], 1)
                 Bf = []
-                for R in E["ranks"]:
+                if _COMPLEX_PROD:
+                    # native complex128: one gather + one fused complex multiply per factor
+                    Ac = torch.complex(Ar, Ai)
+                    for R in E["ranks"]:
+                        pc = Ac.index_select(1, R["idx"][0])
+                        for k in range(1, R["rank"] - 1):
+                            pc = pc * Ac.index_select(1, R["idx"][k])
+                        prod_r = torch.real(pc * Ac.index_select(1, R["idx"][-1]))
+                        Bf.append(torch.zeros(prod_r.shape[0], R["nfunc"], dtype=torch.float64, device=dev)
+                                  .index_add(1, R["msum"], prod_r * R["gcg"]))
+                for R in ([] if _COMPLEX_PROD else E["ranks"]):
                     ar, ai = Ar.index_select(1, R["idx"][0]), Ai.index_select(1, R["idx"][0])
                     for k in range(1, R["rank"] - 1):
                         br, bi = Ar.index_select(1, R["idx"][k]), Ai.index_select(1, R["idx"][k])

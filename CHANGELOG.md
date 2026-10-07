@@ -81,3 +81,8 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - An uncaught error on any rank aborts the job instead of leaving the others waiting; only rank 0 deletes old
   metrics files (restarts in a run directory killed ranks) and prints the metric tables.
 - `test_size: 0` gives no test set instead of a crash; ASE `atoms.calc` replaces `set_calculator`.
+
+### 9. Speed experiments, off by default (2026-10-07)
+
+- A dense A-basis by batched matrix products: -38% memory, +46% time. Products in complex numbers: -3.5% time at
+  first. Both exact; both removed in 11 (slower and larger than the prefix tree).
