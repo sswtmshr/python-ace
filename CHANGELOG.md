@@ -13,6 +13,7 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | upstream TensorFlow (start) | | 20.0 | 22.9 GiB | single GPU only |
 | 1 multinode (TensorFlow) | 2026-08-31 | | | 6.3 s/eval on 4 A100s |
 | 3 PyTorch backend | 2026-10-06 | 13.7* | 32.4 GiB* | 3.75 s/eval on 4 A100s |
+| 4 forward-over-reverse (trial) | 2026-10-06 | 21.45 | 30.87 GiB | |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 
@@ -44,3 +45,10 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - Effect: 20.0 -> **13.7 s/eval** (same A100, same job); 4 A100s **3.75 s/eval** vs **6.3** for TensorFlow (1).
   Agreement with TensorFlow: energies 3e-14 eV/at, forces 2e-13 eV/A, stress 4e-12 GPa, gradient 9e-14. 4 ranks
   reproduce 1 rank to 1e-14.
+
+### 4. Loss gradient by forward-over-reverse differentiation: a trial (2026-10-06)
+
+- The gradient of the force term is a second derivative. Forward-over-reverse (a forward-mode derivative pushed
+  through the backward pass) instead of reverse-over-reverse (the backward pass differentiated again); both exact.
+- Measured, one A100, batch 94: 21.45 s/eval and 30.87 GiB, against 13.73 s/eval and 32.39 GiB for
+  reverse-over-reverse: 57% slower for 5% less memory (separate jobs). Undone in 6.
