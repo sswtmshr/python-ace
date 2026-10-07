@@ -62,7 +62,7 @@ def attach_single_point_calculator(row):
     energy = row["energy_corrected"]
     forces = row["forces"]
     calc = SinglePointCalculator(atoms, energy=energy, forces=forces)
-    atoms.set_calculator(calc)
+    atoms.calc = calc
     return atoms
 
 
@@ -516,10 +516,19 @@ def train_test_split(df, test_size: Union[float, int]) -> Tuple[pd.DataFrame, pd
     """
     n_samples = len(df)
     if test_size >= 1:
+        if test_size != int(test_size) or test_size >= n_samples:
+            raise ValueError("test_size = {}: an integer test_size must be a whole number below the {} structures "
+                             "of the dataset".format(test_size, n_samples))
+        test_size = int(test_size)
         train_size = n_samples - test_size
     elif 0 < test_size and test_size < 1:
-        test_size = int(n_samples * test_size)
+        frac, test_size = test_size, int(n_samples * test_size)
+        if test_size == 0:
+            raise ValueError("test_size = {} of {} structures is an empty test set".format(frac, n_samples))
         train_size = n_samples - test_size
+    else:
+        raise ValueError("test_size = {}: must be a fraction in (0, 1) or a number of structures; leave it out for "
+                         "no test set".format(test_size))
 
     inds = np.arange(len(df))
     np.random.shuffle(inds)
@@ -701,7 +710,7 @@ class ACEDataset:
         if "test_filename" in self.data_config:
             test_filenames = self.data_config["test_filename"]
             self.test_data = self.load_dataset(test_filenames)
-        elif "test_size" in self.data_config:
+        elif self.data_config.get("test_size"):     # absent, None or 0: no test set
             test_size = self.data_config["test_size"]
             log.info("Splitting out test dataset (test_size = {}) from main dataset({} samples)".
                      format(test_size, len(self.fitting_data)))

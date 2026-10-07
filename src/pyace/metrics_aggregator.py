@@ -179,6 +179,16 @@ class FitMetrics:
                 pass
 
 
+def _remove_on_root(filename):
+    """delete an old metrics file before rewriting it: rank 0 only (under MPI every rank builds a MetricsAggregator;
+    concurrent removals made all but one rank die with FileNotFoundError on restarts in an existing directory)"""
+    if filename is not None and _mpi.is_root():
+        try:
+            os.remove(filename)
+        except FileNotFoundError:
+            pass
+
+
 class MetricsAggregator:
     # format: str (column name) or tuple (column name, col width)
     columns = [("ladder_step", 11), ("cycle_step", 11), ("iter_num", 8),  # reduce column width
@@ -209,30 +219,26 @@ class MetricsAggregator:
         self.test_ladder_metrics_filename = test_ladder_metrics_filename
         self.test_cycle_metrics_filename = test_cycle_metrics_filename
 
-        if os.path.isfile(self.running_metrics_filename):
-            os.remove(self.running_metrics_filename)
+        _remove_on_root(self.running_metrics_filename)
         self.write_metric_table_title_to_file(self.running_metrics_filename)
         self.write_metric_table_title_to_file(self.test_running_metrics_filename)
 
         if self.ladder_metrics_filename is not None:
-            if os.path.isfile(self.ladder_metrics_filename):
-                os.remove(self.ladder_metrics_filename)
+            _remove_on_root(self.ladder_metrics_filename)
             self.ladder_metrics_columns = MetricsAggregator.columns.copy()
             # except cycle_step and iter_num
             self.ladder_metrics_columns = self.ladder_metrics_columns[:1] + self.ladder_metrics_columns[3:]
             self.write_metric_table_title_to_file(self.ladder_metrics_filename, columns=self.ladder_metrics_columns)
 
         if self.cycle_metrics_filename is not None:
-            if os.path.isfile(self.cycle_metrics_filename):
-                os.remove(self.cycle_metrics_filename)
+            _remove_on_root(self.cycle_metrics_filename)
             self.cycle_metrics_columns = MetricsAggregator.columns.copy()
             self.cycle_metrics_columns = self.cycle_metrics_columns[:2] + self.cycle_metrics_columns[3:]
             self.write_metric_table_title_to_file(self.cycle_metrics_filename,
                                                   columns=self.cycle_metrics_columns)
 
         if self.test_ladder_metrics_filename is not None:
-            if os.path.isfile(self.test_ladder_metrics_filename):
-                os.remove(self.test_ladder_metrics_filename)
+            _remove_on_root(self.test_ladder_metrics_filename)
             self.ladder_metrics_columns = MetricsAggregator.columns.copy()
             # except cycle_step and iter_num
             self.ladder_metrics_columns = self.ladder_metrics_columns[:1] + self.ladder_metrics_columns[3:]
@@ -240,8 +246,7 @@ class MetricsAggregator:
                                                   columns=self.ladder_metrics_columns)
 
         if self.test_cycle_metrics_filename is not None:
-            if os.path.isfile(self.test_cycle_metrics_filename):
-                os.remove(self.test_cycle_metrics_filename)
+            _remove_on_root(self.test_cycle_metrics_filename)
             self.cycle_metrics_columns = MetricsAggregator.columns.copy()
             self.cycle_metrics_columns = self.cycle_metrics_columns[:2] + self.cycle_metrics_columns[3:]
             self.write_metric_table_title_to_file(self.test_cycle_metrics_filename,
@@ -360,6 +365,8 @@ class MetricsAggregator:
 
     @staticmethod
     def print_extended_metrics(fit_metrics_dict, title="FIT_STATS"):
+        if not _mpi.is_root():   # MPI: rank 0 prints, the other ranks would repeat the same table
+            return
         # (self, iter_num, total_loss, reg_comps, reg_weights, title='FIT STATS', nfuncs=None):
 
         iter_num = fit_metrics_dict["iter_num"]
@@ -453,6 +460,8 @@ class MetricsAggregator:
 
     @staticmethod
     def print_detailed_metrics(fit_metrics_dict, title='Iteration:'):
+        if not _mpi.is_root():   # MPI: rank 0 prints, the other ranks would repeat the same table
+            return
         # fit_metrics_dict
         iter_num = fit_metrics_dict["iter_num"]
         total_loss = fit_metrics_dict["loss"]

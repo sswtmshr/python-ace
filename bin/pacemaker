@@ -137,6 +137,8 @@ def main(args):
         interim_potentails = glob.glob("interim_potential*.yaml")
         ensemble_potentails = glob.glob("ensemble_potential*.yaml")
         for filename in sorted(files_to_remove + interim_potentails + ensemble_potentails):
+            if not _MPI_ROOT:   # under MPI only rank 0 deletes
+                continue
             if os.path.isfile(filename):
                 os.remove(filename)
                 print(" - ", filename)

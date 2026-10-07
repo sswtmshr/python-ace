@@ -160,10 +160,10 @@ def calculate_minimal_nn_tp_atoms_per_bond(tp_atoms):
 
 
 def copy_atoms(atoms):
-    if atoms.get_calculator() is not None:
-        calc = atoms.get_calculator()
+    if atoms.calc is not None:
+        calc = atoms.calc
         new_atoms = atoms.copy()
-        new_atoms.set_calculator(calc)
+        new_atoms.calc = calc
     else:
         new_atoms = atoms.copy()
 

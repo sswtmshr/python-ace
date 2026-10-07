@@ -491,7 +491,7 @@ def augment_structure_eos(
         )
 
     # remove calc
-    df_selected[ASE_ATOMS_C].map(lambda a: a.set_calculator(None));
+    df_selected[ASE_ATOMS_C].map(lambda a: setattr(a, "calc", None));
     return df_selected[
         [
             NAME_C,
@@ -523,7 +523,7 @@ def compute_enn_df(atoms, calc, compute_zbl=False, nn_distance_range=(1, 5),
     fzbls = []
     for z, curr_atoms in zip(nn_distances, generate_nndist_atoms(atoms, nn_distances)):
         # compute ACE energy
-        curr_atoms.set_calculator(calc)
+        curr_atoms.calc = calc
         epas.append(curr_atoms.get_potential_energy() / natoms)
         try:
             vpas.append(curr_atoms.get_volume() / natoms)
@@ -538,7 +538,7 @@ def compute_enn_df(atoms, calc, compute_zbl=False, nn_distance_range=(1, 5),
         structs.append(curr_atoms)
 
         if compute_zbl:
-            curr_atoms.set_calculator(zblcalc)
+            curr_atoms.calc = zblcalc
             epa_zbls.append(curr_atoms.get_potential_energy() / natoms)
             fzbls.append(curr_atoms.get_forces())
     df = (

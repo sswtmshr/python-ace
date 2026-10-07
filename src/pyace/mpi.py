@@ -79,7 +79,28 @@ def _comm():
                 _warned = True
             return None
         _comm_cache = MPI.COMM_WORLD
+        if _comm_cache.Get_size() > 1:
+            _install_abort_on_exception(_comm_cache)
     return _comm_cache
+
+
+def _install_abort_on_exception(comm):
+    """An uncaught exception on one rank would leave the others waiting in the next collective until the wall time;
+    print the traceback, then MPI_Abort the whole job (what `python -m mpi4py` does)."""
+    import sys
+    prev = sys.excepthook
+
+    def hook(etype, value, tb):
+        prev(etype, value, tb)
+        if not issubclass(etype, KeyboardInterrupt):
+            try:
+                sys.stderr.write("[pacemaker.mpi] rank {}: uncaught {}, aborting all ranks\n".format(
+                    comm.Get_rank(), etype.__name__))
+                sys.stderr.flush()
+            finally:
+                comm.Abort(1)
+
+    sys.excepthook = hook
 
 
 def _mpi():

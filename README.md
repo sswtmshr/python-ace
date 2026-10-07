@@ -54,6 +54,8 @@ Without a `backend:` section pacemaker uses `pyace`, upstream's C++ evaluator on
 ## New input keys
 
 ```yaml
+data:
+  test_size: 0                # no test set (upstream crashed)
 fit:
   interim_save_every_s: 30    # interim_potential_*.yaml at most every 30 s (0 = every iteration, as upstream)
 ```
@@ -84,7 +86,8 @@ PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 bash -c 'CUDA_VISIBLE_DEVICES=$SLURM
   launcher, and warns if two ranks share a GPU. TensorFlow (its own MPI code in `TensorPotential/`): the launch
   line gives each rank its GPU.
 - Every rank runs the same optimizer. Each evaluates a contiguous share of the batches; loss and gradient are summed
-  over the ranks, so every rank takes the same step. Only rank 0 writes files.
+  over the ranks, so every rank takes the same step. Only rank 0 writes files; an error on any rank
+  ends the whole job instead of leaving the others waiting.
 - Optimizers: BFGS, L-BFGS-B, CG.
 - `PACEMAKER_MPI_REPRODUCIBLE=1`: sums in a fixed rank order instead of the MPI library's (results still depend on
   the number of ranks).

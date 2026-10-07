@@ -75,3 +75,9 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 
 - Weights follow the weighting policy (GRACE convention); a dataset `w_stress` column wins. Fixes the first PyTorch
   version, which overwrote that column with 1/N.
+
+### 8. MPI robustness and small upstream fixes (2026-10-07)
+
+- An uncaught error on any rank aborts the job instead of leaving the others waiting; only rank 0 deletes old
+  metrics files (restarts in a run directory killed ranks) and prints the metric tables.
+- `test_size: 0` gives no test set instead of a crash; ASE `atoms.calc` replaces `set_calculator`.

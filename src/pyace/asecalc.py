@@ -273,7 +273,7 @@ PyACE ASE ensemble calculator
         # loop over calculators
         for calc in self.calcs:
             cur_atoms = atoms.copy()
-            cur_atoms.set_calculator(calc)
+            cur_atoms.calc = calc
             cur_energy = cur_atoms.get_potential_energy()
 
             energy_lst.append(cur_energy)
