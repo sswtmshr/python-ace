@@ -67,7 +67,9 @@ fit:
 
 - `w_stress` > 0 adds the stress residual (6 Voigt components) to the loss; 0 or absent: upstream behaviour.
 - The dataset needs a `stress` column: 3x3 or 6 Voigt components per structure, eV/A^3, ASE sign convention.
-- Only fully periodic structures with a finite stress label count; their weights are uniform.
+- **Weights.** A dataset `w_stress` column wins. Otherwise they follow the weighting policy: uniform -> uniform,
+  EnergyBasedWeightingPolicy -> the energy weights, ExternalWeightingPolicy -> its `w_stress` column. They are
+  normalised over the fully periodic structures with a finite stress label.
 - Both GPU backends fit stress. Stress errors are printed and written with the energy and force metrics.
 - An unknown key in `fit: loss:` is an error, so a typo cannot silently do nothing.
 

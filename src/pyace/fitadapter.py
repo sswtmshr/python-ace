@@ -38,10 +38,21 @@ class BackendConfig:
 
 
 def attach_stress_weights(df, w_stress):
-    """w_stress > 0: per-structure stress-loss weight column `w_stress` = 1/N over the fully periodic structures
-    with a finite 6- or 9-component `stress` label (ASE convention, eV/A^3), 0 elsewhere; batching_data then
-    copies label and weight into tp_atoms. w_stress = 0: nothing (stress not fitted)."""
-    if df is None or not w_stress:
+    """Per-structure stress-loss weights in column `w_stress` (w_stress > 0; w_stress = 0: nothing, stress not fitted).
+
+    A structure counts only if it is fully periodic and has a finite 6- or 9-component `stress` label (ASE convention,
+    eV/A^3); all others get weight 0.
+      * the dataset already has a `w_stress` column: those weights are kept (zeroed where the structure does not
+        count) and normalised to sum 1, like w_energy;
+      * no `w_stress` column: uniform 1/N over the structures that count.
+    The global factor fit: loss: w_stress multiplies the normalised weights in both cases. batching_data then copies
+    label and weight into tp_atoms."""
+    if df is None:
+        return
+    if not w_stress:
+        # stress not fitted: no stress weights reach the backend (the weighting policies always create the column)
+        if "w_stress" in df.columns:
+            df.drop(columns="w_stress", inplace=True)
         return
     if "stress" not in df.columns:
         raise ValueError("fit: loss: w_stress > 0 needs a `stress` column (ASE Voigt, eV/A^3) in the dataset")
@@ -49,9 +60,26 @@ def attach_stress_weights(df, w_stress):
     if "ase_atoms" in df.columns:
         ok &= df["ase_atoms"].map(lambda a: bool(np.all(a.get_pbc())))
     n = int(ok.sum())
-    df["w_stress"] = ok.astype(np.float64) / max(n, 1)
-    log.info("Stress fit: w_stress = {}, {} of {} structures with a stress label".format(w_stress, n, len(df)))
-
+    if "w_stress" in df.columns:
+        w = pd.to_numeric(df["w_stress"], errors="coerce").astype(np.float64)
+        if w.isna().any() or (w < 0).any():
+            raise ValueError("column w_stress has {} NaN/non-numeric and {} negative entries".format(
+                int(w.isna().sum()), int((w < 0).sum())))
+        dropped = int(((w > 0) & ~ok).sum())
+        w = w.where(ok, 0.)
+        tot = float(w.sum())
+        if tot <= 0:
+            raise ValueError("column w_stress is zero on every structure with a usable stress label")
+        df["w_stress"] = w / tot
+        log.info("Stress fit: w_stress = {}, per-structure weights from the w_stress column (see 'Stress weights:' "
+                 "above for their source) "
+                 "({} of {} structures with a usable stress label, {} nonzero weights; {} weights on structures "
+                 "without a usable label set to 0); normalised to sum 1".format(
+                     w_stress, n, len(df), int((w > 0).sum()), dropped))
+    else:
+        df["w_stress"] = ok.astype(np.float64) / max(n, 1)
+        log.info("Stress fit: w_stress = {}, uniform weights 1/N over the {} of {} structures with a usable stress "
+                 "label".format(w_stress, n, len(df)))
 
 
 def _tp_backend(evaluator_name):

@@ -38,7 +38,7 @@ def batching_data(df, batch_size=10):
     has_w = "w_energy" in df.columns and "w_forces" in df.columns
     if not has_w:
         log.warning("no w_energy/w_forces columns: unit weights are used")
-    has_s = "w_stress" in df.columns
+    has_s = "w_stress" in df.columns and "stress" in df.columns
     tp_col = df["tp_atoms"].tolist()
     we = df["w_energy"].tolist() if has_w else [None] * len(df)
     wf = df["w_forces"].tolist() if has_w else [None] * len(df)

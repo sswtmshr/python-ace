@@ -70,3 +70,8 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 - Each rank picks its GPU itself, from its MPI node-local rank (any launcher, no pinning in the launch line), with a
   warning when two ranks share a GPU.
 - Bug fix: a numeric `data: reference_energy` was silently replaced by 0.
+
+### 7. Per-structure stress weights (2026-10-07)
+
+- Weights follow the weighting policy (GRACE convention); a dataset `w_stress` column wins. Fixes the first PyTorch
+  version, which overwrote that column with 1/N.

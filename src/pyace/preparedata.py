@@ -86,6 +86,20 @@ def check_df_non_empty(df: pd.DataFrame):
         raise RuntimeError("Couldn't operate with empty dataset. Try to reduce filters and constraints")
 
 
+WEIGHTS_STRESS_COLUMN = "w_stress"
+
+
+def set_policy_stress_weights(df: pd.DataFrame, policy_weights, source="weighting policy"):
+    """Per-structure stress-loss weights from the weighting policy (GRACE convention: uniform policy -> uniform,
+    energy-based -> the energy weights), unless the dataset supplies its own `w_stress` column, which is kept.
+    Unusable stress labels are zeroed and the weights renormalised in fitadapter.attach_stress_weights."""
+    if WEIGHTS_STRESS_COLUMN in df.columns and not df[WEIGHTS_STRESS_COLUMN].isna().all():
+        log.info("Stress weights: the dataset's `{}` column is kept".format(WEIGHTS_STRESS_COLUMN))
+        return
+    df[WEIGHTS_STRESS_COLUMN] = np.asarray(policy_weights, dtype=np.float64) * np.ones(len(df))
+    log.info("Stress weights: {}".format(source))
+
+
 def normalize_energy_forces_weights(df: pd.DataFrame):
     if df is None:
         return
@@ -103,6 +117,10 @@ def normalize_energy_forces_weights(df: pd.DataFrame):
 
     assert np.allclose(df[WEIGHTS_ENERGY_COLUMN].sum(), 1)
     assert np.allclose(df[WEIGHTS_FORCES_COLUMN].map(sum).sum(), 1)
+    if WEIGHTS_STRESS_COLUMN in df.columns:
+        ws = pd.to_numeric(df[WEIGHTS_STRESS_COLUMN], errors="coerce")
+        if not ws.isna().any() and ws.sum() > 0:   # NaN / all-zero: reported by attach_stress_weights if stress is fitted
+            df[WEIGHTS_STRESS_COLUMN] = ws / ws.sum()
 
 
 class StructuresDatasetWeightingPolicy:
@@ -381,6 +399,8 @@ class EnergyBasedWeightingPolicy(StructuresDatasetWeightingPolicy):
         forces_weights_sum = df[WEIGHTS_FORCES_COLUMN].map(sum).sum()
         assert np.allclose(forces_weights_sum, 1), "Forces weights sum differs from one and equal to {}".format(
             forces_weights_sum)
+        set_policy_stress_weights(df, df[WEIGHTS_ENERGY_COLUMN].to_numpy(),
+                                  "= energy weights (EnergyBasedWeightingPolicy, as in GRACE)")
         return df
 
     def plot(self, df):
@@ -419,6 +439,7 @@ class UniformWeightingPolicy(StructuresDatasetWeightingPolicy):
         df[WEIGHTS_ENERGY_COLUMN] = 1. / len(df)
         df[WEIGHTS_FORCES_COLUMN] = df[FORCES_COL].map(lambda forces: np.ones(len(forces)))
         df[WEIGHTS_FORCES_COLUMN] = df[WEIGHTS_FORCES_COLUMN] * df[WEIGHTS_ENERGY_COLUMN]
+        set_policy_stress_weights(df, 1. / len(df), "uniform (UniformWeightingPolicy)")
         normalize_energy_forces_weights(df)
         return df
 
@@ -458,8 +479,16 @@ class ExternalWeightingPolicy(StructuresDatasetWeightingPolicy):
             if col_to_drop in df.columns:
                 df.drop(columns=col_to_drop, inplace=True)
 
-        mdf = pd.merge(df, self.weights_df[[WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN]], left_index=True,
-                       right_index=True)
+        ext_cols = [WEIGHTS_ENERGY_COLUMN, WEIGHTS_FORCES_COLUMN]
+        if WEIGHTS_STRESS_COLUMN in self.weights_df.columns:
+            ext_cols.append(WEIGHTS_STRESS_COLUMN)
+            if WEIGHTS_STRESS_COLUMN in df.columns:
+                df = df.drop(columns=WEIGHTS_STRESS_COLUMN)
+        mdf = pd.merge(df, self.weights_df[ext_cols], left_index=True, right_index=True)
+        if WEIGHTS_STRESS_COLUMN in self.weights_df.columns:
+            log.info("Stress weights: from the external weights file")
+        else:
+            set_policy_stress_weights(mdf, 1. / len(mdf), "uniform (external weights file has no w_stress column)")
         if not (mdf[FORCES_COL].map(len) == mdf[WEIGHTS_FORCES_COLUMN].map(len)).all():
             error_msg = ("Shape of the `{}` column doesn't correspond to the shape of "
                          "`forces` column in original dataframe").format(WEIGHTS_FORCES_COLUMN)
@@ -571,6 +600,8 @@ def apply_weights(df: Optional[pd.DataFrame], weighting_policy_spec, ignore_weig
             WEIGHTS_FACTOR))
         df[WEIGHTS_ENERGY_COLUMN] *= df[WEIGHTS_FACTOR]
         df[WEIGHTS_FORCES_COLUMN] *= df[WEIGHTS_FACTOR]
+        if WEIGHTS_STRESS_COLUMN in df.columns:
+            df[WEIGHTS_STRESS_COLUMN] *= df[WEIGHTS_FACTOR]
     return df
 
 
@@ -599,6 +630,10 @@ def adjust_aug_weights(df: Optional[pd.DataFrame], aug_factor) -> Optional[pd.Da
             log.info(f"Decreasing augmented weights by factor {aug_factor:.3g}")
             df.loc[aug_mask, WEIGHTS_ENERGY_COLUMN] *= aug_factor
             df.loc[aug_mask, WEIGHTS_FORCES_COLUMN] *= aug_factor
+            if WEIGHTS_STRESS_COLUMN in df.columns:
+                if df.loc[aug_mask, WEIGHTS_STRESS_COLUMN].isna().any():
+                    df.loc[aug_mask, WEIGHTS_STRESS_COLUMN] = df.loc[~aug_mask, WEIGHTS_STRESS_COLUMN].median()
+                df.loc[aug_mask, WEIGHTS_STRESS_COLUMN] *= aug_factor
     return df
 
 
