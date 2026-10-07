@@ -23,7 +23,8 @@ from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding,
 # A-basis construction: "dense" (batched matmul over padded neighbours) or "scatter" (per-pair products + index_add)
 _DENSE_A = os.environ.get("PACETORCH_ABASIS", "scatter") == "dense"
 # product basis: "complex" (complex128 tensors) or "real" (separate real/imaginary parts)
-_COMPLEX_PROD = os.environ.get("PACETORCH_PRODUCTS", "real") == "complex"   # default flips after validation
+_PRODUCTS = os.environ.get("PACETORCH_PRODUCTS", "real")       # real | complex | gemm
+_COMPLEX_PROD = _PRODUCTS == "complex"
 
 _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12,
       'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23,
@@ -34,6 +35,44 @@ _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9,
       'Er': 68, 'Tm': 69, 'Yb': 70, 'Lu': 71, 'Hf': 72, 'Ta': 73, 'W': 74, 'Re': 75, 'Os': 76, 'Ir': 77, 'Pt': 78,
       'Au': 79, 'Hg': 80, 'Tl': 81, 'Pb': 82, 'Bi': 83, 'Po': 84, 'At': 85, 'Rn': 86, 'Fr': 87, 'Ra': 88, 'Ac': 89,
       'Th': 90, 'Pa': 91, 'U': 92, 'Np': 93, 'Pu': 94}
+
+
+def _prefix_tree(ranks, ncols):
+    """Product basis as shared prefixes + one GEMM (PACETORCH_PRODUCTS=gemm).
+
+    Every ms-combination is a product of r A-columns; products commute, so sort the columns, take the first r-1 as
+    the prefix and the last one as the free factor. The prefixes form a tree: level 1 = the A columns themselves,
+    level k = (level k-1 node) x (one A column), only the nodes some combination needs. With all prefixes P [atoms, N]
+    and T[p, j, d] = sum of gcg_c * coef[f(c), d] over the combinations c with prefix p and last column j,
+        rho_d = Re sum_j A_j sum_p P_p T[p, j, d],
+    i.e. one matmul P @ T plus an elementwise product with A: exact, only the summation order changes."""
+    node = {}                       # prefix tuple (len >= 2) -> index within its level
+    levels = []                     # per level k >= 2: (parent index in level k-1, column)
+    pref, last, func, gcg_all = [], [], [], []
+    fofs = 0
+    for R in ranks:
+        idx = np.stack([i.numpy() for i in R["idx"]], 1)
+        for c, cols in enumerate(np.sort(idx, 1)):
+            t = tuple(int(x) for x in cols[:-1])
+            for k in range(2, len(t) + 1):
+                if t[:k] not in node:
+                    if len(levels) < k - 1:
+                        levels.append(([], []))
+                    lv = levels[k - 2]
+                    node[t[:k]] = len(lv[0])
+                    lv[0].append(t[0] if k == 2 else node[t[:k - 1]])
+                    lv[1].append(t[k - 1])
+            pref.append((len(t), node[t] if len(t) > 1 else t[0]))
+            last.append(int(cols[-1]))
+            func.append(fofs + int(R["msum"][c]))
+            gcg_all.append(float(R["gcg"][c]))
+        fofs += R["nfunc"]
+    # row of a prefix in P = cat(level 1 (= A, ncols columns), level 2, ...)
+    off = np.cumsum([0, ncols] + [len(lv[0]) for lv in levels])
+    rows = np.array([off[k - 1] + i for (k, i) in pref], dtype=np.int64)
+    return dict(levels=[(torch.tensor(a, dtype=torch.long), torch.tensor(b, dtype=torch.long)) for a, b in levels],
+                nrows=int(off[-1]), flat=torch.tensor(rows * ncols + np.array(last, dtype=np.int64)),
+                func=torch.tensor(func, dtype=torch.long), gcg=torch.tensor(gcg_all, dtype=torch.float64))
 
 
 class ACE:
@@ -128,7 +167,7 @@ class ACE:
                 ranks.append(dict(rank=r, nfunc=len(fr), idx=[torch.tensor(i, dtype=torch.long) for i in idx],
                                   gcg=torch.tensor(gcg, dtype=torch.float64),
                                   msum=torch.tensor(msum, dtype=torch.long)))
-            self.elem.append(dict(nd=nd, ncols=len(used), chan=chan, ranks=ranks,
+            self.elem.append(dict(nd=nd, ncols=len(used), chan=chan, ranks=ranks, tree=_prefix_tree(ranks, len(used)),
                                   coefs_idx=torch.tensor(coefs_part[ne], dtype=torch.long),
                                   fs=list(self.embed_spec[ne].FS_parameters), npot=self.embed_spec[ne].npoti,
                                   rho_cut=float(self.embed_spec[ne].rho_core_cutoff),
@@ -173,6 +212,9 @@ class ACE:
         mv = lambda t: t.to(self.device)
         for E in self.elem:
             E["coefs_idx"] = mv(E["coefs_idx"])
+            Tr = E["tree"]
+            Tr["levels"] = [(mv(a), mv(b)) for a, b in Tr["levels"]]
+            Tr["flat"], Tr["func"], Tr["gcg"] = mv(Tr["flat"]), mv(Tr["func"]), mv(Tr["gcg"])
             for R in E["ranks"]:
                 R["idx"] = [mv(i) for i in R["idx"]]
                 R["gcg"], R["msum"] = mv(R["gcg"]), mv(R["msum"])
@@ -350,7 +392,23 @@ class ACE:
                 Ar = torch.cat([blk_r[e].get(mu, None) if mu in blk_r[e] else z(mu) for mu in sorted(E["chan"])], 1)
                 Ai = torch.cat([blk_i[e].get(mu, None) if mu in blk_i[e] else z(mu) for mu in sorted(E["chan"])], 1)
                 Bf = []
-                if _COMPLEX_PROD:
+                if _PRODUCTS == "gemm":
+                    nd, nc = E["nd"], E["ncols"]
+                    Tr = E["tree"]
+                    C = bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, nd)
+                    T = torch.zeros(Tr["nrows"] * nc, nd, dtype=torch.float64, device=dev).index_add(
+                        0, Tr["flat"], C.index_select(0, Tr["func"]) * Tr["gcg"].unsqueeze(1))
+                    T = T.view(Tr["nrows"], nc * nd)
+                    pr, pi = [Ar], [Ai]
+                    for parent, col in Tr["levels"]:
+                        a_r, a_i = pr[-1].index_select(1, parent), pi[-1].index_select(1, parent)
+                        b_r, b_i = Ar.index_select(1, col), Ai.index_select(1, col)
+                        pr.append(a_r * b_r - a_i * b_i)
+                        pi.append(a_i * b_r + a_r * b_i)
+                    Y = torch.cat([torch.cat(pr, 1), torch.cat(pi, 1)], 0) @ T          # [2 atoms, ncols*nd]
+                    Yr, Yi = Y[:ne_].view(ne_, nc, nd), Y[ne_:].view(ne_, nc, nd)
+                    rho = rho + (Ar.unsqueeze(2) * Yr - Ai.unsqueeze(2) * Yi).sum(1)
+                elif _COMPLEX_PROD:
                     # native complex128: one gather + one fused complex multiply per factor
                     Ac = torch.complex(Ar, Ai)
                     for R in E["ranks"]:
@@ -360,7 +418,7 @@ class ACE:
                         prod_r = torch.real(pc * Ac.index_select(1, R["idx"][-1]))
                         Bf.append(torch.zeros(prod_r.shape[0], R["nfunc"], dtype=torch.float64, device=dev)
                                   .index_add(1, R["msum"], prod_r * R["gcg"]))
-                for R in ([] if _COMPLEX_PROD else E["ranks"]):
+                for R in (E["ranks"] if _PRODUCTS == "real" else []):
                     ar, ai = Ar.index_select(1, R["idx"][0]), Ai.index_select(1, R["idx"][0])
                     for k in range(1, R["rank"] - 1):
                         br, bi = Ar.index_select(1, R["idx"][k]), Ai.index_select(1, R["idx"][k])
@@ -369,8 +427,9 @@ class ACE:
                     prod_r = ar * br - ai * bi            # last factor: real part only
                     Bf.append(torch.zeros(prod_r.shape[0], R["nfunc"], dtype=torch.float64, device=dev)
                               .index_add(1, R["msum"], prod_r * R["gcg"]))
-                Bm = torch.cat(Bf, dim=1)
-                rho = rho + Bm @ bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, E["nd"])
+                if Bf:
+                    Bm = torch.cat(Bf, dim=1)
+                    rho = rho + Bm @ bcoefs.index_select(0, E["coefs_idx"]).reshape(-1, E["nd"])
             safe = torch.where(rho != 0., rho, rho + 1e-32)
             en = 0.
             for p in range(E["nd"]):

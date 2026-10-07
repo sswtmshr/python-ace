@@ -15,6 +15,7 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | 3 PyTorch backend | 2026-10-06 | 13.7* | 32.4 GiB* | 3.75 s/eval on 4 A100s |
 | 4 forward-over-reverse (trial) | 2026-10-06 | 21.45 | 30.87 GiB | |
 | 6 back to reverse-over-reverse, int32 indices | 2026-10-06 | | 30.75 GiB** | |
+| 10 prefix-tree products | 2026-10-07 | 10.33 | 27.17 GiB | |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 - \*\* measured after 7 and 8, which do not change memory (32.39 -> 30.75 GiB: the int32 index arrays).
@@ -86,3 +87,9 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 
 - A dense A-basis by batched matrix products: -38% memory, +46% time. Products in complex numbers: -3.5% time at
   first. Both exact; both removed in 11 (slower and larger than the prefix tree).
+
+### 10. Product basis as a shared-prefix tree plus one GEMM (2026-10-07)
+
+- Products sharing their first factors compute each shared prefix once; all last factors are one matrix product.
+- One A100, one job (59475340): 11.75 s / 30.75 GiB -> 10.33 s / 27.17 GiB (-12% each). Exact vs TensorFlow (1e-13)
+  and the C++ evaluator.
