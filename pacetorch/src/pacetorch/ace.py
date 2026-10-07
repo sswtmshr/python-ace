@@ -8,8 +8,8 @@ Differences from the TF implementation are in how the same numbers are computed,
   * all index bookkeeping (bond-type partition, atom->element, unique central atoms) is done once per batch on the
     host (prepare_batch), instead of dynamic_partition / tf.unique / tf.where inside every evaluation;
   * the atomic base A is built only for the (mu_j, n, l, m) channels the product basis actually uses, with no padding
-    to nradmax/lmax, and pairs are scatter-added straight into it (or, PACETORCH_ABASIS=outer, as segmented outer
-    products with hand-written derivatives: less memory);
+    to nradmax/lmax; on a GPU (PACETORCH_ABASIS=auto/outer) as segmented outer products with hand-written derivatives
+    and fused Triton kernels, never materialising [pairs, channels] arrays; otherwise pairs are scatter-added;
   * the product basis shares common partial products (a prefix tree) and does the last factor of all ms-combinations
     of all functions as one matrix multiply, of which only the real part is needed (ACE.products).
 """
@@ -20,15 +20,24 @@ import torch
 
 import os
 
+from pacetorch import _kernels
 from pacetorch.functions import SphericalHarmonics, cutoff_func_poly, embedding, radial_function
 
-# A-basis construction (identical results, a memory/speed trade-off):
-#   "scatter" (default) per-pair products + index_add, plain autograd
-#   "outer"   segmented outer products with hand-written derivatives (_SegOuter): ~2.5x less GPU memory, slower so far
-#             (becomes the default only once it is at least as fast)
-_ABASIS = os.environ.get("PACETORCH_ABASIS", "scatter")
-if _ABASIS not in ("outer", "scatter"):
-    raise ValueError("PACETORCH_ABASIS={}: use outer or scatter".format(_ABASIS))
+# A-basis construction (identical results):
+#   "outer"   segmented outer products with hand-written derivatives (_SegOuter), run by fused Triton kernels on a
+#             GPU (_kernels.py): A100, SiC batch 94: 1.5x faster and 2.3x less memory than scatter
+#   "scatter" per-pair products + index_add, plain autograd: faster than outer where the kernels cannot run (outer
+#             then uses its torch formulation, which needs less memory but is slower)
+#   "auto"    (default) outer where the Triton kernels run, scatter elsewhere (CPU, no Triton)
+_ABASIS = os.environ.get("PACETORCH_ABASIS", "auto")
+if _ABASIS not in ("auto", "outer", "scatter"):
+    raise ValueError("PACETORCH_ABASIS={}: use auto, outer or scatter".format(_ABASIS))
+# PACETORCH_TRITON=0: never use the kernels (outer then always runs its torch formulation; auto picks scatter)
+_TRITON = os.environ.get("PACETORCH_TRITON", "1") != "0"
+
+
+def _use_outer(t):
+    return _ABASIS == "outer" or (_ABASIS == "auto" and _TRITON and _kernels.available(t))
 
 _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9, 'Ne': 10, 'Na': 11, 'Mg': 12,
       'Al': 13, 'Si': 14, 'P': 15, 'S': 16, 'Cl': 17, 'Ar': 18, 'K': 19, 'Ca': 20, 'Sc': 21, 'Ti': 22, 'V': 23,
@@ -42,7 +51,8 @@ _Z = {'H': 1, 'He': 2, 'Li': 3, 'Be': 4, 'B': 5, 'C': 6, 'N': 7, 'O': 8, 'F': 9,
 
 
 class _SegOuter(torch.autograd.Function):
-    """A[a, n, m] = sum over pairs p of atom a (idx[p] = a) of sum_k u_k[p, n] v_k[p, m];  apply(idx, nat, u1, v1, ...).
+    """A[a, n, m] = sum over pairs p of atom a of sum_k u_k[p, n] v_k[p, m];  apply(seg, nat, u1, v1, ...) with
+    seg = (idx, ptr): idx[p] = central atom of pair p, pairs sorted by it, ptr = segment offsets.
 
     The A-basis is sum_j R_nl(r_j) Y_lm(r_j); per l that is this segmented outer product with u = R_l, v = (Re, Im)
     Y_l. Autograd through the plain version saves and re-reads several [pairs, channels] arrays per derivative order;
@@ -51,11 +61,14 @@ class _SegOuter(torch.autograd.Function):
     only ever keeps the per-pair factors and per-atom arrays."""
 
     @staticmethod
-    def forward(ctx, idx, nat, *uv):
+    def forward(ctx, seg, nat, *uv):
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(idx, *uv)
-        ctx.nat = nat
+        ctx.save_for_backward(*uv)
+        ctx.seg = seg
         us, vs = uv[0::2], uv[1::2]
+        if _TRITON and _kernels.available(us[0]):
+            return _kernels.seg_outer(us, vs, seg[1], nat)
+        idx = seg[0]
         P, n, m = us[0].shape[0], us[0].shape[1], vs[0].shape[1]
         acc = us[0].unsqueeze(2) * vs[0].unsqueeze(1)
         for u, v in zip(us[1:], vs[1:]):
@@ -64,7 +77,7 @@ class _SegOuter(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, G):
-        idx, *uv = ctx.saved_tensors
+        uv = ctx.saved_tensors
         grads = [None] * len(uv)
         if G is None:
             return (None, None, *grads)
@@ -77,27 +90,29 @@ class _SegOuter(torch.autograd.Function):
                     ws.append(uv[k - 1]); dims.append(1)
                 need.append(k)
         if ws:
-            for k, o in zip(need, _GatherContract.apply(G, idx, tuple(dims), *ws)):
+            for k, o in zip(need, _GatherContract.apply(G, ctx.seg, tuple(dims), *ws)):
                 grads[k] = o
         return (None, None, *grads)
 
 
 class _GatherContract(torch.autograd.Function):
     """out_k[p] = contraction of G[idx[p]] with w_k[p]: over m (dims[k] = 2, -> [P, n]) or over n (dims[k] = 1,
-    -> [P, m]); apply(G, idx, dims, w1, w2, ...). One gather of G serves all outputs."""
+    -> [P, m]); apply(G, seg, dims, w1, w2, ...), seg as in _SegOuter. One gather of G serves all outputs."""
 
     @staticmethod
-    def forward(ctx, G, idx, dims, *ws):
+    def forward(ctx, G, seg, dims, *ws):
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(G, idx, *ws)
-        ctx.dims = dims
-        Gp = G.index_select(0, idx)
+        ctx.save_for_backward(G, *ws)
+        ctx.seg, ctx.dims = seg, dims
+        if _TRITON and _kernels.available(G):
+            return tuple(_kernels.gather_contract(G, seg[0], w, d) for w, d in zip(ws, dims))
+        Gp = G.index_select(0, seg[0])
         return tuple((Gp * w.unsqueeze(1)).sum(2) if d == 2 else (Gp * w.unsqueeze(2)).sum(1)
                      for w, d in zip(ws, dims))
 
     @staticmethod
     def backward(ctx, *hs):
-        G, idx, *ws = ctx.saved_tensors
+        G, *ws = ctx.saved_tensors
         gG, gws = None, [None] * len(ws)
         if ctx.needs_input_grad[0]:
             uv = []
@@ -105,13 +120,13 @@ class _GatherContract(torch.autograd.Function):
                 if h is not None:   # dims 2: dG[n, m] += h[n] w[m];  dims 1: dG[n, m] += w[n] h[m]
                     uv += [h, w] if d == 2 else [w, h]
             if uv:
-                gG = _SegOuter.apply(idx, G.shape[0], *uv)
+                gG = _SegOuter.apply(ctx.seg, G.shape[0], *uv)
         nw, nd, need = [], [], []
         for k, (d, h) in enumerate(zip(ctx.dims, hs)):
             if h is not None and ctx.needs_input_grad[3 + k]:
                 nw.append(h); nd.append(1 if d == 2 else 2); need.append(k)
         if nw:
-            for k, o in zip(need, _GatherContract.apply(G, idx, tuple(nd), *nw)):
+            for k, o in zip(need, _GatherContract.apply(G, ctx.seg, tuple(nd), *nw)):
                 gws[k] = o
         return (gG, None, None, *gws)
 
@@ -360,8 +375,11 @@ class ACE:
         for ci, (e, mu) in enumerate(self.bond_combs):
             k = e * self.nelements + mu
             p = order[bounds[k]:bounds[k + 1]]
+            o = np.argsort(local[ind_i[p]], kind="stable")      # pairs grouped by central atom (segments)
+            p = p[o]
             cl = local[ind_i[p]]
-            pairs.append(dict(p=p, central=ind_i[p], central_local=cl))
+            ptr = np.searchsorted(cl, np.arange(len(atoms_e[e]) + 1))
+            pairs.append(dict(p=p, central=ind_i[p], central_local=cl, ptr=ptr))
             present[ind_i[p], ci] = True
         return dict(nat=nat, atoms_e=atoms_e, pairs=pairs, present=present)
 
@@ -445,7 +463,7 @@ class ACE:
                     r1 = torch.nn.functional.pad(r1, (0, nd_max - B["nd"]))
                 rho1[e] = rho1[e] + r1
             # A_{mu n l m}: R_nl(r) Y_lm(rhat), only the used channels
-            if B["has_A"] and _ABASIS == "outer":
+            if B["has_A"] and _use_outer(g):
                 crad = coefs[slice(*B["crad"])].reshape(B["nradmax"], B["lmax"] + 1, B["nradbase"])
                 yl = B["sh"].compute_blocks(rij / d.unsqueeze(1))              # per l: [P, 2(2l+1)] (Re, Im)
                 ne_ = len(idx["atoms_e_cpu"][e])
@@ -453,7 +471,7 @@ class ACE:
                 for l in range(B["L"] + 1):
                     nl = B["n_l"][l]
                     if nl:
-                        blocks.append(_SegOuter.apply(P["central_local"], ne_, g @ crad[:nl, l, :].t(), yl[l])
+                        blocks.append(_SegOuter.apply(P["seg"], ne_, g @ crad[:nl, l, :].t(), yl[l])
                                       .reshape(ne_, -1))
                 Af = torch.cat(blocks, 1)
                 blk_r[e][mu] = Af.index_select(1, B["o_r"])

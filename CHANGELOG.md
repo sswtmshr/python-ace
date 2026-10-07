@@ -17,6 +17,7 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
 | 6 back to reverse-over-reverse, int32 indices | 2026-10-06 | | 30.75 GiB** | |
 | 10 prefix-tree products | 2026-10-07 | 10.33 | 27.17 GiB | |
 | 11 hand-written A-basis derivatives | 2026-10-07 | | 11.68 GiB | |
+| 12 Triton kernels | 2026-10-07 | 6.88 | 11.66 GiB | |
 
 - \* same job as the upstream row (one A100); every later one-GPU row ran on another node.
 - \*\* measured after 7 and 8, which do not change memory (32.39 -> 30.75 GiB: the int32 index arrays).
@@ -102,3 +103,11 @@ evaluation of the loss and its gradient over the whole set, what BFGS needs per 
   [pairs x channels] array.
 - One A100 (job 59476318): 12.01 s / 27.18 GiB -> 11.03 s / 11.68 GiB. Equal to automatic differentiation to 1e-15
   (gradcheck and gradgradcheck). The experiments of 9 are removed.
+
+### 12. A-basis as fused Triton kernels (2026-10-07)
+
+- Each sum of 11 becomes one GPU kernel that writes straight into A, with an exact torch fallback where Triton does
+  not run.
+- 11.03 -> 7.64 s (job 59476318, memory unchanged); as released 6.88 s / 11.66 GiB (job 59475464). Of the A-basis
+  gain, 22% from 11 and 78% from the kernels. Exact vs TensorFlow (gradient 9e-14).
+- Batch size 47 -> 94 -> 188 gains only 7%, then 5%: the memory saving buys larger bases and structures.

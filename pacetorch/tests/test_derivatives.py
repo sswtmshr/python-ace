@@ -19,8 +19,9 @@ def test_segouter_derivatives():
     P, n, m, nat = 13, 3, 5, 4
     u = torch.randn(P, n, dtype=torch.float64, requires_grad=True)
     v = torch.randn(P, m, dtype=torch.float64, requires_grad=True)
-    idx = torch.randint(0, nat, (P,))
-    f = lambda u, v: A._SegOuter.apply(idx, nat, u, v)
+    idx = torch.sort(torch.randint(0, nat, (P,))).values
+    seg = (idx, torch.searchsorted(idx, torch.arange(nat + 1)))
+    f = lambda u, v: A._SegOuter.apply(seg, nat, u, v)
     assert torch.autograd.gradcheck(f, (u, v))
     assert torch.autograd.gradgradcheck(f, (u, v))
 
@@ -34,6 +35,32 @@ def test_segouter_derivatives():
         res.append([E] + list(torch.autograd.grad((gu ** 2).sum(), (u, v))))
     for a, b in zip(*res):
         assert torch.allclose(a, b, rtol=1e-12, atol=1e-12)
+
+
+def test_triton_kernels_match_torch():
+    """GPU only: the fused kernels against the torch formulation, all derivative orders (via the full model)."""
+    if not torch.cuda.is_available() or not A._kernels.available(torch.zeros(1, dtype=torch.float64, device="cuda")):
+        print("test_triton_kernels_match_torch: skipped (no CUDA / Triton)")
+        return
+    from pacetorch.potential import TorchPotential
+    bconf, b = _model_and_batch()
+    specs = {"loss_force_factor": 0.3, "loss_energy_factor": 0.7, "loss_stress_factor": 0.5}
+    out = {}
+    saved = A._ABASIS, A._TRITON
+    try:
+        for tri in (False, True):
+            A._ABASIS, A._TRITON = "outer", tri
+            ace = A.ACE(bconf, device="cuda")
+            c0 = ace.get_coefs()
+            ace.set_coefs(c0 + np.random.default_rng(2).normal(scale=0.3, size=c0.shape))
+            tp = TorchPotential(ace, specs)
+            out[tri] = [x.cpu().numpy() if torch.is_tensor(x) else np.asarray(x)
+                        for x in tp.loss_and_grad(tp.device_batch(b))]
+    finally:
+        A._ABASIS, A._TRITON = saved
+    for name, a, r in zip(("loss", "grad", "E", "F", "stress"), out[True], out[False]):
+        err = np.max(np.abs(a - r)) / max(np.max(np.abs(r)), 1e-300)
+        assert err < 1e-11, "{}: relative difference {:.2e}".format(name, err)
 
 
 def _model_and_batch():
@@ -122,4 +149,6 @@ if __name__ == "__main__":
     test_segouter_derivatives()
     test_products_match_direct_formula()
     test_abasis_paths_agree()
+    if torch.cuda.is_available():
+        test_triton_kernels_match_torch()
     print("ok")

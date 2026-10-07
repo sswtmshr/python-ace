@@ -107,6 +107,18 @@ fit:
   stops before the deadline and leaves `BFGS_PAUSED`. The next run with the same checkpoint continues with the saved
   curvature, from the potential you give it (for example the last interim potential).
 
+## Speed
+
+SiC benchmark set (3735 structures, 538k atoms, 5640 coefficients, batch 94), one loss + gradient evaluation, one A100:
+
+| | s/eval | peak memory |
+|---|---|---|
+| upstream TensorFlow 2.13 | 20.0 | 22.9 GiB |
+| PyTorch backend | 6.88 | 11.7 GiB |
+
+The product basis is a shared-prefix tree plus one matrix multiply; the A-basis uses hand-written derivatives, run
+as fused Triton kernels on NVIDIA GPUs (exact torch fallback elsewhere).
+
 ## Credits and licence
 
 pacemaker / python-ace and TensorPotential are by Yury Lysogorskiy, Anton Bochkarev, Ralf Drautz et al. (ICAMS,
