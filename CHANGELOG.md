@@ -150,3 +150,11 @@ A four-part independent audit (model, fit loop and MPI, data, packaging); about 
 
 - pacemaker now stops with an error for `evaluator: tensorpot` under MPI.
 - Zero core-repulsion terms are skipped: 7.69 -> 7.40 s on one (slower) node.
+
+### 17. BFGS inverse Hessian split over the ranks (2026-10-18, v0.2.7)
+
+- Problem: one GPU holds the whole N x N inverse Hessian, 8 N^2 bytes: 12.8 GB at N = 40,000, next to the batches.
+- Change: each rank keeps a block of rows; one allgather per update. Checkpoints are written in parts, so a fit can
+  resume with a different number of ranks.
+- Checks: bitwise equal to the unsplit version with the same row blocks (1-16 ranks, 1-2 nodes); 4 GPUs end-to-end
+  1.3e-15 (GPU run-to-run 1.2e-15). A GPU error or a damaged checkpoint no longer hangs the job.

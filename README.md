@@ -1,7 +1,7 @@
 # pacemaker with stress fitting, multi-GPU / multi-node training and a PyTorch backend
 
 A fork of [ICAMS/python-ace](https://github.com/ICAMS/python-ace) (pacemaker), with [ICAMS/TensorPotential](https://github.com/ICAMS/TensorPotential) (pacemaker's TensorFlow backend) in
-`TensorPotential/`. Same model, `input.yaml` and potential files as upstream. The original
+`TensorPotential/`. Release **v0.2.7**. Same model, `input.yaml` and potential files as upstream. The original
 pacemaker README follows at the end.
 
 **Compatibility rule.** An `input.yaml` that runs with upstream pacemaker runs here unchanged and means the same
@@ -94,6 +94,8 @@ PACEMAKER_MPI=1 srun -n 8 --gpus-per-node 4 pacemaker input.yaml
   ends the whole job instead of leaving the others waiting.
 - Out of GPU memory on any rank (PyTorch): all ranks reduce the batch size together and restart from the
   last accepted BFGS step.
+- The BFGS inverse Hessian is split over the ranks by rows (`PACE_BFGS_SPLIT=0`: on rank 0 only), so N is
+  no longer limited by one GPU; a checkpoint resumes with any number of ranks.
 - Optimizers: BFGS, L-BFGS-B, CG.
 - `PACEMAKER_MPI_REPRODUCIBLE=1`: sums in a fixed rank order instead of the MPI library's (results still depend on
   the number of ranks).

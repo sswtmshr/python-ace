@@ -16,8 +16,12 @@ with BLAS dger on the CPU (0.14 s; the old numpy outer-product update took 0.52 
 Options (fit: options: {...} in input.yaml, or environment):
   checkpoint:        path of the .npz checkpoint (env PACE_BFGS_CKPT); unset = no checkpoint
   checkpoint_every:  iterations between saves (env PACE_BFGS_EVERY, default 10), and at least
-  checkpoint_min_s:  seconds between saves (env PACE_BFGS_MIN_S, default 60; a 700 MB write takes ~1 s)
+  checkpoint_min_s:  seconds between saves (env PACE_BFGS_MIN_S, default 900; ~0.66 GB/s per writing rank)
   device:            torch device for the inverse Hessian (set by the torch fitter); None = CPU
+  bfgs_split:        inverse Hessian rows spread over all MPI ranks, each on its own GPU (default on; false or env
+                     PACE_BFGS_SPLIT=0 = the inverse Hessian on rank 0 alone, as before), see bfgs_split.py
+  bfgs_split_gpu_only: with bfgs_split, rows that do not fit on the GPUs raise CUDA OOM on every rank (pacemaker then
+                     shrinks the batch) instead of falling back to the CPU (default on; false or PACE_BFGS_SPLIT_GPU_ONLY=0 off)
   deadline:          unix time of the allocation end (env PACE_DEADLINE); margin: seconds (env PACE_MARGIN, 240)
   gtol, norm, maxiter: as scipy
 """
@@ -143,7 +147,8 @@ class _InvHessian:
 
 
 # scipy BFGS options this implementation honours (plus its own); anything else -> use_scipy() says why
-_OWN = {"checkpoint", "checkpoint_every", "checkpoint_min_s", "deadline", "margin", "device"}
+_OWN = {"checkpoint", "checkpoint_every", "checkpoint_min_s", "deadline", "margin", "device", "bfgs_split",
+        "bfgs_split_gpu_only"}
 _SAME_AS_SCIPY = {"gtol", "norm", "maxiter", "disp", "xrtol", "c1", "c2",
                   "eps", "finite_diff_rel_step", "workers"}   # eps/finite_diff/workers: unused, the gradient is given
 _paused = [False]
@@ -173,6 +178,13 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
     different tag or size is ignored. Returns a scipy OptimizeResult; status/message as scipy's BFGS (0 success,
     1 maxiter, 2 precision loss, 3 NaN) plus 9 = paused for the allocation deadline (was_paused())."""
     o = dict(options or {})
+    split = o.pop("bfgs_split", None)                       # default on; bfgs_split: false or PACE_BFGS_SPLIT=0 turns it off
+    if split is None:
+        split = os.environ.get("PACE_BFGS_SPLIT", "1").lower() not in ("0", "false", "no", "off")
+    if bool(split):
+        from pyace import bfgs_split   # inverse Hessian rows spread over all MPI ranks (pyace/bfgs_split.py)
+        return bfgs_split.minimize_bfgs(fun, x0, args=args, callback=callback, options=o, tag=tag)
+    o.pop("bfgs_split_gpu_only", None)
     gtol = float(o.get("gtol", 1e-5))
     norm = o.get("norm", np.inf)
     xrtol = float(o.get("xrtol", 0))
@@ -180,7 +192,7 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
     disp = bool(o.get("disp", False))
     path = o.get("checkpoint", os.environ.get("PACE_BFGS_CKPT"))
     every = max(1, int(o.get("checkpoint_every", os.environ.get("PACE_BFGS_EVERY", 10)) or 1))
-    min_s = float(o.get("checkpoint_min_s", os.environ.get("PACE_BFGS_MIN_S", 60)))
+    min_s = float(o.get("checkpoint_min_s", os.environ.get("PACE_BFGS_MIN_S", 900)))
     device = o.get("device")
     deadline = float(o.get("deadline", os.environ.get("PACE_DEADLINE", "inf")))
     margin = float(o.get("margin", os.environ.get("PACE_MARGIN", 240)))
@@ -207,8 +219,14 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
             ck = np.load(path)
             ck_tag = float(ck["kappa"])
             same = (np.isnan(tag) and np.isnan(ck_tag)) or abs(ck_tag - tag) < 1e-12
-            if ck["H"].shape == (N, N) and same and np.all(np.isfinite(ck["H"])):
-                H = np.array(ck["H"])
+            if "H" in ck.files:
+                Hck = ck["H"]
+            else:   # written by the row-split BFGS: index + one part file per rank
+                R0 = int(ck["split"])
+                ks = ".k%d" % int(ck["kset"]) if "kset" in ck.files else ""
+                Hck = np.vstack([np.load("%s%s.part%dof%d.npz" % (path, ks, r, R0))["H"] for r in range(R0)])
+            if Hck.shape == (N, N) and same and np.all(np.isfinite(Hck)):
+                H = np.array(Hck)
                 k_total = int(ck["k"])
                 dx = float(np.max(np.abs(ck["x"] - x0)))
                 if dx < 1e-10 * (1 + np.max(np.abs(x0))):
@@ -216,7 +234,7 @@ def minimize_bfgs(fun, x0, args=(), callback=None, options=None, tag=np.nan):
                 log.info("BFGS: inverse Hessian loaded from %s (N=%d, %d iterations so far, max|x - x_ckpt| = %.2e)",
                          path, N, k_total, dx)
             else:
-                log.info("BFGS: %s ignored (N %s vs %d, tag %s vs %s, or not finite): H = I", path, ck["H"].shape, N,
+                log.info("BFGS: %s ignored (N %s vs %d, tag %s vs %s, or not finite): H = I", path, Hck.shape, N,
                          ck_tag, tag)
         except Exception as e:  # noqa: BLE001 - unreadable checkpoint: plain start
             log.warning("BFGS: could not read %s (%s): H = I", path, e)
